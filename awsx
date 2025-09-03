@@ -1,0 +1,177 @@
+#!/bin/bash
+#
+# A script to manage EC2 instances: list, start, stop, force-stop, switch types, update SSH config, and show status.
+#
+# Usage: ./manage-ec2.sh {list|start|stop|force-stop|switch <gpu|cpu>|update-ssh|status}
+
+# --- Configuration ---
+# The 'Name' tag of the EC2 instance you want to manage.
+if [ -z "INSTANCE_NAME" ]; then
+    echo "❌ Error: INSTANCE_NAME environment variable is not set"
+    echo "   Please set INSTANCE_NAME"
+    exit 1
+fi
+
+
+SSH_CONFIG_FILE="$HOME/.ssh/config"
+
+# --- Instance Type Configuration ---
+GPU_INSTANCE_TYPE="g4dn.4xlarge"
+CPU_INSTANCE_TYPE="m6i.2xlarge" # 8 vCPUs, 32 GiB RAM
+
+# --- Colors for output ---
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Exit immediately if a command exits with a non-zero status.
+set -e
+
+# --- Function to display the instance's current deployment info ---
+show_status() {
+    echo -e "${YELLOW}Fetching deployment status for instance: ${INSTANCE_NAME}...${NC}"
+    INSTANCE_INFO=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" --query "Reservations[0].Instances[0].{ID:InstanceId, Type:InstanceType, State:State.Name, PublicIP:PublicIpAddress, PrivateIP:PrivateIpAddress}" --output json)
+    if [ -z "$INSTANCE_INFO" ] || [ "$INSTANCE_INFO" == "null" ]; then
+        echo -e "${RED}Error: Instance '${INSTANCE_NAME}' not found.${NC}"; exit 1; fi
+    ID=$(echo "$INSTANCE_INFO" | jq -r .ID); TYPE=$(echo "$INSTANCE_INFO" | jq -r .Type); STATE=$(echo "$INSTANCE_INFO" | jq -r .State)
+    PUBLIC_IP=$(echo "$INSTANCE_INFO" | jq -r '.PublicIP // "N/A"'); PRIVATE_IP=$(echo "$INSTANCE_INFO" | jq -r '.PrivateIP // "N/A"')
+    STATE_COLOR=$YELLOW; if [ "$STATE" == "running" ]; then STATE_COLOR=$GREEN; elif [ "$STATE" == "stopped" ]; then STATE_COLOR=$RED; fi
+    echo -e "-------------------------------------\n  Instance Name:  ${GREEN}${INSTANCE_NAME}${NC}\n  Instance ID:    ${ID}\n  Instance Type:  ${TYPE}\n  State:          ${STATE_COLOR}${STATE}${NC}\n  Private IP:     ${PRIVATE_IP}\n  Public IP:      ${PUBLIC_IP}\n-------------------------------------"
+}
+
+# --- Function to list all stopped instances ---
+list_stopped() {
+    echo -e "${YELLOW}Fetching list of stopped EC2 instances...${NC}"
+    aws ec2 describe-instances --filters "Name=instance-state-name,Values=stopped" --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value, Type:InstanceType}" --output table
+}
+
+# --- Function to update the ~/.ssh/config file ---
+update_ssh_config() {
+    local instance_id=$1
+    echo -e "${YELLOW}Updating SSH config file: ${SSH_CONFIG_FILE}...${NC}"
+    NEW_HOSTNAME=$(aws ec2 describe-instances --instance-ids "${instance_id}" --query "Reservations[0].Instances[0].PublicDnsName" --output text)
+    if [ -z "$NEW_HOSTNAME" ] || [ "$NEW_HOSTNAME" == "None" ]; then
+        echo -e "${RED}Error: Could not retrieve a public DNS name for the instance.${NC}"; exit 1; fi
+    echo "New public DNS: ${NEW_HOSTNAME}"
+    if ! grep -q -E "^\s*Host\s+${INSTANCE_NAME}\s*$" "$SSH_CONFIG_FILE"; then
+        echo -e "${RED}Error: Host entry for '${INSTANCE_NAME}' not found in ${SSH_CONFIG_FILE}.${NC}"; exit 1; fi
+    awk -v name="${INSTANCE_NAME}" -v host="${NEW_HOSTNAME}" '
+        $1 == "Host" && $2 == name { in_block=1 }
+        $1 == "Host" && $2 != name { in_block=0 }
+        (in_block && tolower($1) == "hostname") {
+            print "  HostName " host
+        }
+        !(in_block && tolower($1) == "hostname") {
+            print
+        }
+    ' "$SSH_CONFIG_FILE" > "${SSH_CONFIG_FILE}.tmp"
+    mv "${SSH_CONFIG_FILE}.tmp" "$SSH_CONFIG_FILE"; chmod 600 "$SSH_CONFIG_FILE"
+    echo -e "${GREEN}SSH config updated successfully for Host '${INSTANCE_NAME}'.${NC}"
+    echo -e "You can now connect using: ${YELLOW}ssh ${INSTANCE_NAME}${NC}"
+}
+
+# --- Entrypoint function to run the SSH update independently ---
+run_ssh_update() {
+    echo -e "${YELLOW}Updating SSH config for running instance: ${INSTANCE_NAME}...${NC}"
+    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+        echo -e "${RED}Error: Instance '${INSTANCE_NAME}' is not running.${NC}\nThe instance must be running to update its hostname."; exit 1; fi
+    update_ssh_config "${INSTANCE_ID}"
+}
+
+# --- Function to start the instance ---
+start_instance() {
+    echo -e "${YELLOW}Attempting to start instance: ${INSTANCE_NAME}...${NC}"
+    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=stopped" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+        echo -e "${RED}Error: Instance '${INSTANCE_NAME}' not found or is not currently stopped.${NC}"; exit 1; fi
+    echo "Found instance ID: ${INSTANCE_ID}"; aws ec2 start-instances --instance-ids "${INSTANCE_ID}" > /dev/null
+    echo -e "${GREEN}Start command sent. Waiting for instance to be in 'running' state...${NC}"
+    aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"; echo -e "${GREEN}Instance is now running.${NC}"
+    update_ssh_config "${INSTANCE_ID}"
+}
+
+# --- Function to stop the instance ---
+stop_instance() {
+    echo -e "${YELLOW}Attempting to stop instance: ${INSTANCE_NAME}...${NC}"
+    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+        echo -e "${GREEN}Instance '${INSTANCE_NAME}' is already stopped.${NC}"; return 0; fi
+    echo "Found running instance ID: ${INSTANCE_ID}"; aws ec2 stop-instances --instance-ids "${INSTANCE_ID}" > /dev/null
+    echo -e "${GREEN}Stop command sent. Waiting for instance to be in 'stopped' state...${NC}"
+    aws ec2 wait instance-stopped --instance-ids "${INSTANCE_ID}"; echo -e "${GREEN}Instance is now stopped.${NC}"
+}
+
+# --- NEW: Function to force stop the instance ---
+force_stop_instance() {
+    echo -e "${RED}🛑 WARNING: Force stopping an instance can lead to data corruption.${NC}"
+    echo -e "${YELLOW}The instance will not shut down gracefully. This is like pulling the power cord.${NC}"
+    read -p "Are you sure you want to proceed? (y/n) " -n 1 -r
+    echo # move to a new line
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Aborted."
+        exit 1
+    fi
+
+    echo -e "${YELLOW}Attempting to force stop instance: ${INSTANCE_NAME}...${NC}"
+    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+        echo -e "${GREEN}Instance '${INSTANCE_NAME}' is not running.${NC}"; return 0; fi
+    echo "Found running instance ID: ${INSTANCE_ID}"
+    aws ec2 stop-instances --instance-ids "${INSTANCE_ID}" --force > /dev/null
+    echo -e "${GREEN}Force stop command sent. Waiting for instance to be in 'stopped' state...${NC}"
+    aws ec2 wait instance-stopped --instance-ids "${INSTANCE_ID}"
+    echo -e "${GREEN}Instance is now stopped.${NC}"
+}
+
+# --- Function to switch the instance type ---
+switch_type() {
+    local target_type_arg=$1
+    if [[ "$target_type_arg" == "gpu" ]]; then NEW_TYPE=$GPU_INSTANCE_TYPE; elif [[ "$target_type_arg" == "cpu" ]]; then NEW_TYPE=$CPU_INSTANCE_TYPE; else
+        echo -e "${RED}Error: Invalid type '${target_type_arg}'. Use 'gpu' or 'cpu'.${NC}"; usage; fi
+    echo -e "${YELLOW}Fetching current status for instance '${INSTANCE_NAME}'...${NC}"
+    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+        echo -e "${RED}Error: Instance '${INSTANCE_NAME}' not found.${NC}"; exit 1; fi
+    INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].{Type:InstanceType, State:State.Name}" --output json)
+    CURRENT_TYPE=$(echo "$INSTANCE_INFO" | jq -r .Type); INSTANCE_STATE=$(echo "$INSTANCE_INFO" | jq -r .State)
+    echo -e "Current instance type is: ${GREEN}${CURRENT_TYPE}${NC}"
+    echo -e "Attempting to switch to type: ${YELLOW}${NEW_TYPE}${NC}"
+    if [ "$CURRENT_TYPE" == "$NEW_TYPE" ]; then echo -e "${GREEN}Instance is already the target type. No action needed.${NC}"; exit 0; fi
+    if [ "$INSTANCE_STATE" == "running" ]; then echo "Instance is running. It will be stopped automatically before changing type."; stop_instance
+    elif [ "$INSTANCE_STATE" != "stopped" ]; then echo -e "${RED}Error: Instance is in state '${INSTANCE_STATE}'. Please wait for it to be stopped or running.${NC}"; exit 1; fi
+    echo "Instance is stopped. Modifying type to ${NEW_TYPE}..."; aws ec2 modify-instance-attribute --instance-id "${INSTANCE_ID}" --instance-type "{\"Value\": \"${NEW_TYPE}\"}"
+    echo -e "${GREEN}Success! Instance type for '${INSTANCE_NAME}' is now '${NEW_TYPE}'.${NC}"; echo "You can start it with './manage-ec2.sh start'."
+}
+
+# --- Main script logic: Parse command-line arguments ---
+usage() {
+    # UPDATED: New usage instructions
+    echo "Usage: $0 {list|start|stop|force-stop|switch <gpu|cpu>|update-ssh|status}"
+    echo "  list          - Lists all stopped EC2 instances."
+    echo "  start         - Starts the '${INSTANCE_NAME}' instance and updates ~/.ssh/config."
+    echo "  stop          - Stops the instance gracefully."
+    echo "  force-stop    - Force stops the instance (risk of data corruption)."
+    echo "  switch <type> - Changes instance type. Type must be 'gpu' or 'cpu'."
+    echo "  update-ssh    - Updates ~/.ssh/config for the running instance."
+    echo "  status        - Displays deployment information for the instance."
+    exit 1
+}
+
+if ! command -v jq &> /dev/null; then
+    echo -e "${RED}'jq' is not installed. This script requires jq to reliably parse instance data.${NC}"
+    echo "Please install it (e.g., 'sudo apt-get install jq' or 'brew install jq') and try again."; exit 1; fi
+if [ -z "$1" ]; then usage; fi
+
+# UPDATED: Handle the new 'force-stop' command
+case "$1" in
+    list) list_stopped ;;
+    start) start_instance ;;
+    stop) stop_instance ;;
+    force-stop) force_stop_instance ;;
+    switch) if [ -z "$2" ]; then echo -e "${RED}Error: The 'switch' command requires a second argument: 'gpu' or 'cpu'.${NC}"; usage; fi; switch_type "$2" ;;
+    update-ssh) run_ssh_update ;;
+    status) show_status ;;
+    *) usage ;;
+esac
