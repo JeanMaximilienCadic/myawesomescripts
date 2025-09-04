@@ -1,0 +1,12 @@
+[Unit]
+Description=Auto-shutdown after 1 hour of inactivity
+After=multi-user.target
+Wants=inactivity-shutdown.timer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/inactivity-shutdown.sh
+User=root
+
+[Install]
+WantedBy=multi-user.target

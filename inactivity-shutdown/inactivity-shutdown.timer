@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for inactivity every 5 minutes
+Requires=inactivity-shutdown.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
