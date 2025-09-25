@@ -1,0 +1,629 @@
+#!/bin/bash
+
+# Project Initialization Script
+# Quickly sets up new projects with common structure and configurations
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Function to display usage
+usage() {
+    echo "Project Initialization Tool"
+    echo
+    echo "Usage: $0 <project_name> [project_type]"
+    echo
+    echo "Project Types:"
+    echo "  python      - Python project with virtual environment"
+    echo "  node        - Node.js project with npm/yarn"
+    echo "  react       - React application"
+    echo "  go          - Go project with modules"
+    echo "  rust        - Rust project with Cargo"
+    echo "  generic     - Generic project (default)"
+    echo
+    echo "Examples:"
+    echo "  $0 my-python-app python"
+    echo "  $0 my-web-app react"
+    echo "  $0 my-tool go"
+    exit 1
+}
+
+# Check arguments
+if [ $# -lt 1 ]; then
+    echo -e "${RED}❌ Error: Project name is required${NC}"
+    usage
+fi
+
+PROJECT_NAME="$1"
+PROJECT_TYPE="${2:-generic}"
+
+# Validate project name
+if [[ ! "$PROJECT_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo -e "${RED}❌ Error: Project name can only contain letters, numbers, hyphens, and underscores${NC}"
+    exit 1
+fi
+
+# Check if directory already exists
+if [ -d "$PROJECT_NAME" ]; then
+    echo -e "${RED}❌ Error: Directory '$PROJECT_NAME' already exists${NC}"
+    exit 1
+fi
+
+echo -e "${BLUE}🚀 Initializing project: ${GREEN}$PROJECT_NAME${NC} ${BLUE}(type: ${GREEN}$PROJECT_TYPE${NC}${BLUE})${NC}"
+echo
+
+# Create project directory
+mkdir -p "$PROJECT_NAME"
+cd "$PROJECT_NAME"
+
+# Initialize git repository
+echo -e "${YELLOW}📦 Initializing git repository...${NC}"
+git init
+echo -e "${GREEN}✓ Git repository initialized${NC}"
+
+# Create basic .gitignore
+echo -e "${YELLOW}📝 Creating .gitignore...${NC}"
+cat > .gitignore << 'EOF'
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+EOF
+
+# Project-specific setup based on type
+case "$PROJECT_TYPE" in
+    "python")
+        echo -e "${YELLOW}🐍 Setting up Python project...${NC}"
+        
+        # Add Python-specific .gitignore entries
+        cat >> .gitignore << 'EOF'
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+.env/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+EOF
+
+        # Create Python project structure
+        mkdir -p src tests docs
+        
+        # Create setup.py
+        cat > setup.py << EOF
+from setuptools import setup, find_packages
+
+setup(
+    name="$PROJECT_NAME",
+    version="0.1.0",
+    description="Description of $PROJECT_NAME",
+    author="Your Name",
+    author_email="your.email@example.com",
+    packages=find_packages(where="src"),
+    package_dir={"": "src"},
+    python_requires=">=3.8",
+    install_requires=[
+        # Add your dependencies here
+    ],
+    extras_require={
+        "dev": [
+            "pytest",
+            "black",
+            "flake8",
+            "mypy",
+        ],
+    },
+)
+EOF
+
+        # Create requirements.txt
+        cat > requirements.txt << 'EOF'
+# Production dependencies
+# Add your requirements here
+
+# Example:
+# requests>=2.25.1
+# numpy>=1.21.0
+EOF
+
+        # Create requirements-dev.txt
+        cat > requirements-dev.txt << 'EOF'
+# Development dependencies
+pytest>=6.0.0
+black>=21.0.0
+flake8>=3.8.0
+mypy>=0.812
+EOF
+
+        # Create main module
+        cat > src/__init__.py << 'EOF'
+EOF
+        
+        cat > src/main.py << EOF
+#!/usr/bin/env python3
+"""
+Main module for $PROJECT_NAME
+"""
+
+def main():
+    """Main function"""
+    print("Hello from $PROJECT_NAME!")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+        # Create test file
+        cat > tests/__init__.py << 'EOF'
+EOF
+        
+        cat > tests/test_main.py << EOF
+"""
+Tests for main module
+"""
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+
+from main import main
+
+def test_main():
+    """Test main function"""
+    # Add your tests here
+    assert True
+EOF
+
+        # Create virtual environment if python3 is available
+        if command -v python3 >/dev/null 2>&1; then
+            echo -e "${YELLOW}🔧 Creating virtual environment...${NC}"
+            python3 -m venv venv
+            echo -e "${GREEN}✓ Virtual environment created${NC}"
+            echo -e "${BLUE}💡 Activate with: source venv/bin/activate${NC}"
+        fi
+        ;;
+        
+    "node"|"react")
+        echo -e "${YELLOW}📦 Setting up Node.js project...${NC}"
+        
+        # Add Node.js-specific .gitignore entries
+        cat >> .gitignore << 'EOF'
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# nyc test coverage
+.nyc_output
+
+# ESLint cache
+.eslintcache
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional REPL history
+.node_repl_history
+
+# Output of 'npm pack'
+*.tgz
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables file
+.env
+.env.test
+
+# parcel-bundler cache (https://parceljs.org/)
+.cache
+.parcel-cache
+
+# next.js build output
+.next
+
+# nuxt.js build output
+.nuxt
+
+# vuepress build output
+.vuepress/dist
+
+# Serverless directories
+.serverless/
+
+# FuseBox cache
+.fusebox/
+
+# DynamoDB Local files
+.dynamodb/
+
+# TernJS port file
+.tern-port
+EOF
+
+        if [ "$PROJECT_TYPE" = "react" ]; then
+            echo -e "${YELLOW}⚛️  Creating React application...${NC}"
+            if command -v npx >/dev/null 2>&1; then
+                npx create-react-app . --template typescript
+                echo -e "${GREEN}✓ React application created${NC}"
+            else
+                echo -e "${RED}❌ npx not found. Please install Node.js and try again${NC}"
+            fi
+        else
+            # Create package.json for regular Node.js project
+            cat > package.json << EOF
+{
+  "name": "$PROJECT_NAME",
+  "version": "1.0.0",
+  "description": "Description of $PROJECT_NAME",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "jest"
+  },
+  "keywords": [],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "nodemon": "^2.0.15",
+    "jest": "^27.5.1"
+  }
+}
+EOF
+
+            # Create main file
+            cat > index.js << EOF
+#!/usr/bin/env node
+
+/**
+ * Main entry point for $PROJECT_NAME
+ */
+
+console.log('Hello from $PROJECT_NAME!');
+
+module.exports = {};
+EOF
+
+            # Create test directory
+            mkdir -p tests
+            cat > tests/index.test.js << EOF
+/**
+ * Tests for $PROJECT_NAME
+ */
+
+describe('$PROJECT_NAME', () => {
+  test('should work', () => {
+    expect(true).toBe(true);
+  });
+});
+EOF
+        fi
+        ;;
+        
+    "go")
+        echo -e "${YELLOW}🐹 Setting up Go project...${NC}"
+        
+        # Add Go-specific .gitignore entries
+        cat >> .gitignore << 'EOF'
+
+# Go
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+vendor/
+
+# Go workspace file
+go.work
+EOF
+
+        # Initialize Go module
+        if command -v go >/dev/null 2>&1; then
+            echo -e "${YELLOW}🔧 Initializing Go module...${NC}"
+            go mod init "$PROJECT_NAME"
+            echo -e "${GREEN}✓ Go module initialized${NC}"
+        fi
+
+        # Create main.go
+        cat > main.go << EOF
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello from $PROJECT_NAME!")
+}
+EOF
+
+        # Create basic package structure
+        mkdir -p cmd pkg internal
+        
+        cat > cmd/main.go << EOF
+package main
+
+import "fmt"
+
+func main() {
+    fmt.Println("Hello from $PROJECT_NAME!")
+}
+EOF
+        ;;
+        
+    "rust")
+        echo -e "${YELLOW}🦀 Setting up Rust project...${NC}"
+        
+        # Add Rust-specific .gitignore entries
+        cat >> .gitignore << 'EOF'
+
+# Rust
+# Generated by Cargo
+target/
+Cargo.lock
+
+# These are backup files generated by rustfmt
+**/*.rs.bk
+EOF
+
+        # Initialize Cargo project
+        if command -v cargo >/dev/null 2>&1; then
+            echo -e "${YELLOW}🔧 Initializing Cargo project...${NC}"
+            cargo init --name "$PROJECT_NAME" .
+            echo -e "${GREEN}✓ Cargo project initialized${NC}"
+        else
+            # Create basic Rust structure manually
+            mkdir -p src
+            cat > Cargo.toml << EOF
+[package]
+name = "$PROJECT_NAME"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+EOF
+
+            cat > src/main.rs << EOF
+fn main() {
+    println!("Hello from $PROJECT_NAME!");
+}
+EOF
+        fi
+        ;;
+        
+    "generic"|*)
+        echo -e "${YELLOW}📁 Setting up generic project...${NC}"
+        
+        # Create basic structure
+        mkdir -p src docs tests
+        
+        cat > README.md << EOF
+# $PROJECT_NAME
+
+Description of your project.
+
+## Installation
+
+Instructions for installing your project.
+
+## Usage
+
+Instructions for using your project.
+
+## Contributing
+
+Instructions for contributing to your project.
+
+## License
+
+License information.
+EOF
+        ;;
+esac
+
+# Create universal README.md if it doesn't exist
+if [ ! -f README.md ]; then
+    echo -e "${YELLOW}📖 Creating README.md...${NC}"
+    cat > README.md << EOF
+# $PROJECT_NAME
+
+Brief description of your project.
+
+## Installation
+
+\`\`\`bash
+# Installation instructions
+\`\`\`
+
+## Usage
+
+\`\`\`bash
+# Usage examples
+\`\`\`
+
+## Development
+
+\`\`\`bash
+# Development setup instructions
+\`\`\`
+
+## Contributing
+
+1. Fork the repository
+2. Create your feature branch (\`git checkout -b feature/amazing-feature\`)
+3. Commit your changes (\`git commit -m 'Add some amazing feature'\`)
+4. Push to the branch (\`git push origin feature/amazing-feature\`)
+5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+EOF
+fi
+
+# Create LICENSE file
+echo -e "${YELLOW}📄 Creating LICENSE file...${NC}"
+cat > LICENSE << EOF
+MIT License
+
+Copyright (c) $(date +%Y) Your Name
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+EOF
+
+# Initial commit
+echo -e "${YELLOW}📦 Creating initial commit...${NC}"
+git add .
+git commit -m "Initial commit: $PROJECT_TYPE project setup"
+echo -e "${GREEN}✓ Initial commit created${NC}"
+
+echo
+echo -e "${GREEN}🎉 Project '$PROJECT_NAME' initialized successfully!${NC}"
+echo
+echo -e "${BLUE}📁 Project structure:${NC}"
+find . -type f -not -path './.git/*' | head -10 | sort
+if [ $(find . -type f -not -path './.git/*' | wc -l) -gt 10 ]; then
+    echo "... and more"
+fi
+
+echo
+echo -e "${BLUE}💡 Next steps:${NC}"
+echo -e "  1. ${YELLOW}cd $PROJECT_NAME${NC}"
+
+case "$PROJECT_TYPE" in
+    "python")
+        echo -e "  2. ${YELLOW}source venv/bin/activate${NC}"
+        echo -e "  3. ${YELLOW}pip install -r requirements-dev.txt${NC}"
+        echo -e "  4. ${YELLOW}python src/main.py${NC}"
+        ;;
+    "node")
+        echo -e "  2. ${YELLOW}npm install${NC}"
+        echo -e "  3. ${YELLOW}npm start${NC}"
+        ;;
+    "react")
+        echo -e "  2. ${YELLOW}npm start${NC}"
+        ;;
+    "go")
+        echo -e "  2. ${YELLOW}go run main.go${NC}"
+        ;;
+    "rust")
+        echo -e "  2. ${YELLOW}cargo run${NC}"
+        ;;
+    *)
+        echo -e "  2. ${YELLOW}Edit README.md with your project details${NC}"
+        ;;
+esac
+
+echo -e "  ${YELLOW}Happy coding! 🚀${NC}"

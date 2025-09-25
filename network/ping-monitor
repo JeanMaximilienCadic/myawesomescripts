@@ -1,0 +1,312 @@
+#!/bin/bash
+
+# Ping Monitor Script
+# Continuously monitors network connectivity to multiple hosts with statistics
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m'
+
+# Default configuration
+HOSTS=("8.8.8.8" "1.1.1.1" "google.com")
+INTERVAL=5
+LOG_FILE=""
+ALERT_THRESHOLD=3
+SOUND_ALERT=false
+CONTINUOUS=true
+COUNT=0
+
+# Statistics arrays
+declare -A SUCCESS_COUNT
+declare -A FAILURE_COUNT
+declare -A TOTAL_COUNT
+declare -A AVG_TIME
+declare -A MIN_TIME
+declare -A MAX_TIME
+declare -A CONSECUTIVE_FAILURES
+
+# Function to display usage
+usage() {
+    echo "Ping Monitor Tool"
+    echo
+    echo "Usage: $0 [OPTIONS] [host1] [host2] ..."
+    echo
+    echo "Options:"
+    echo "  -i, --interval SECONDS    Ping interval (default: 5)"
+    echo "  -c, --count NUMBER        Number of pings per host (0 = infinite, default: 0)"
+    echo "  -l, --log FILE            Log results to file"
+    echo "  -t, --threshold NUMBER    Alert after N consecutive failures (default: 3)"
+    echo "  -s, --sound               Enable sound alerts (requires beep/speaker-test)"
+    echo "  -q, --quiet               Quiet mode (only show failures)"
+    echo "  -h, --help                Show this help message"
+    echo
+    echo "Default hosts: 8.8.8.8, 1.1.1.1, google.com"
+    echo
+    echo "Examples:"
+    echo "  $0                                    # Monitor default hosts"
+    echo "  $0 -i 2 -t 5 google.com github.com   # Custom hosts with 2s interval"
+    echo "  $0 -l ping.log -s 192.168.1.1        # Log to file with sound alerts"
+    echo "  $0 -c 10 -q 8.8.8.8                  # 10 pings in quiet mode"
+    exit 0
+}
+
+# Parse command line arguments
+QUIET=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -i|--interval)
+            INTERVAL="$2"
+            shift 2
+            ;;
+        -c|--count)
+            COUNT="$2"
+            CONTINUOUS=false
+            shift 2
+            ;;
+        -l|--log)
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        -t|--threshold)
+            ALERT_THRESHOLD="$2"
+            shift 2
+            ;;
+        -s|--sound)
+            SOUND_ALERT=true
+            shift
+            ;;
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            usage
+            ;;
+        *)
+            # Custom hosts provided
+            if [ ${#HOSTS[@]} -eq 3 ] && [ "${HOSTS[0]}" = "8.8.8.8" ]; then
+                # Clear default hosts if custom ones are provided
+                HOSTS=()
+            fi
+            HOSTS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Initialize statistics
+for host in "${HOSTS[@]}"; do
+    SUCCESS_COUNT[$host]=0
+    FAILURE_COUNT[$host]=0
+    TOTAL_COUNT[$host]=0
+    AVG_TIME[$host]=0
+    MIN_TIME[$host]=999999
+    MAX_TIME[$host]=0
+    CONSECUTIVE_FAILURES[$host]=0
+done
+
+# Function to log message
+log_message() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    if [ -n "$LOG_FILE" ]; then
+        echo "$timestamp - $message" >> "$LOG_FILE"
+    fi
+}
+
+# Function to play alert sound
+play_alert() {
+    if [ "$SOUND_ALERT" = true ]; then
+        if command -v beep >/dev/null 2>&1; then
+            beep -f 1000 -l 200 2>/dev/null || true
+        elif command -v speaker-test >/dev/null 2>&1; then
+            timeout 1 speaker-test -t sine -f 1000 >/dev/null 2>&1 || true
+        elif command -v paplay >/dev/null 2>&1 && [ -f /usr/share/sounds/alsa/Front_Left.wav ]; then
+            paplay /usr/share/sounds/alsa/Front_Left.wav 2>/dev/null || true
+        fi
+    fi
+}
+
+# Function to ping a single host
+ping_host() {
+    local host="$1"
+    local result
+    local ping_time
+    local status
+    
+    # Perform ping
+    if result=$(ping -c 1 -W 3 "$host" 2>&1); then
+        # Extract ping time
+        ping_time=$(echo "$result" | grep "time=" | sed -n 's/.*time=\([0-9.]*\).*/\1/p')
+        if [ -z "$ping_time" ]; then
+            ping_time="0"
+        fi
+        
+        status="SUCCESS"
+        SUCCESS_COUNT[$host]=$((SUCCESS_COUNT[$host] + 1))
+        CONSECUTIVE_FAILURES[$host]=0
+        
+        # Update timing statistics
+        if (( $(echo "$ping_time < ${MIN_TIME[$host]}" | bc -l 2>/dev/null || echo "0") )); then
+            MIN_TIME[$host]=$ping_time
+        fi
+        if (( $(echo "$ping_time > ${MAX_TIME[$host]}" | bc -l 2>/dev/null || echo "0") )); then
+            MAX_TIME[$host]=$ping_time
+        fi
+        
+        # Calculate average
+        local total_success=${SUCCESS_COUNT[$host]}
+        if [ "$total_success" -gt 0 ]; then
+            AVG_TIME[$host]=$(echo "scale=2; (${AVG_TIME[$host]} * ($total_success - 1) + $ping_time) / $total_success" | bc -l 2>/dev/null || echo "$ping_time")
+        fi
+        
+    else
+        status="FAILURE"
+        ping_time="N/A"
+        FAILURE_COUNT[$host]=$((FAILURE_COUNT[$host] + 1))
+        CONSECUTIVE_FAILURES[$host]=$((CONSECUTIVE_FAILURES[$host] + 1))
+        
+        # Check for alert threshold
+        if [ "${CONSECUTIVE_FAILURES[$host]}" -eq "$ALERT_THRESHOLD" ]; then
+            echo -e "${RED}🚨 ALERT: $host has failed $ALERT_THRESHOLD consecutive times!${NC}"
+            log_message "ALERT: $host has failed $ALERT_THRESHOLD consecutive times"
+            play_alert
+        fi
+    fi
+    
+    TOTAL_COUNT[$host]=$((TOTAL_COUNT[$host] + 1))
+    
+    # Display result
+    local timestamp=$(date '+%H:%M:%S')
+    if [ "$status" = "SUCCESS" ]; then
+        if [ "$QUIET" = false ]; then
+            echo -e "${GREEN}[$timestamp] $host: ✓ ${ping_time}ms${NC}"
+        fi
+        log_message "$host: SUCCESS ${ping_time}ms"
+    else
+        echo -e "${RED}[$timestamp] $host: ✗ FAILED${NC}"
+        log_message "$host: FAILED"
+    fi
+}
+
+# Function to display statistics
+display_statistics() {
+    echo
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}            STATISTICS                  ${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    
+    for host in "${HOSTS[@]}"; do
+        local total=${TOTAL_COUNT[$host]}
+        local success=${SUCCESS_COUNT[$host]}
+        local failure=${FAILURE_COUNT[$host]}
+        local success_rate=0
+        
+        if [ "$total" -gt 0 ]; then
+            success_rate=$(echo "scale=1; $success * 100 / $total" | bc -l 2>/dev/null || echo "0")
+        fi
+        
+        echo -e "${YELLOW}Host: $host${NC}"
+        echo -e "  Total pings: $total"
+        echo -e "  Success: ${GREEN}$success${NC}"
+        echo -e "  Failures: ${RED}$failure${NC}"
+        echo -e "  Success rate: ${success_rate}%"
+        echo -e "  Consecutive failures: ${CONSECUTIVE_FAILURES[$host]}"
+        
+        if [ "$success" -gt 0 ]; then
+            echo -e "  Avg time: ${AVG_TIME[$host]}ms"
+            echo -e "  Min time: ${MIN_TIME[$host]}ms"
+            echo -e "  Max time: ${MAX_TIME[$host]}ms"
+        fi
+        echo
+    done
+    
+    echo -e "${CYAN}========================================${NC}"
+}
+
+# Function to handle Ctrl+C
+cleanup() {
+    echo
+    echo -e "${YELLOW}Monitoring stopped.${NC}"
+    display_statistics
+    exit 0
+}
+
+# Set trap for cleanup
+trap cleanup INT TERM
+
+# Validate interval
+if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]] || [ "$INTERVAL" -lt 1 ]; then
+    echo -e "${RED}❌ Error: Invalid interval. Must be a positive integer.${NC}"
+    exit 1
+fi
+
+# Validate alert threshold
+if ! [[ "$ALERT_THRESHOLD" =~ ^[0-9]+$ ]] || [ "$ALERT_THRESHOLD" -lt 1 ]; then
+    echo -e "${RED}❌ Error: Invalid alert threshold. Must be a positive integer.${NC}"
+    exit 1
+fi
+
+# Check if bc is available for calculations
+if ! command -v bc >/dev/null 2>&1; then
+    echo -e "${YELLOW}⚠️  'bc' not found. Some calculations may be less accurate.${NC}"
+    echo -e "${YELLOW}   Install with: sudo apt-get install bc${NC}"
+fi
+
+# Display header
+echo -e "${BLUE}🔍 Ping Monitor Started${NC}"
+echo -e "${BLUE}Hosts: ${HOSTS[*]}${NC}"
+echo -e "${BLUE}Interval: ${INTERVAL}s${NC}"
+echo -e "${BLUE}Alert threshold: $ALERT_THRESHOLD consecutive failures${NC}"
+
+if [ "$CONTINUOUS" = false ]; then
+    echo -e "${BLUE}Count: $COUNT pings per host${NC}"
+fi
+
+if [ -n "$LOG_FILE" ]; then
+    echo -e "${BLUE}Logging to: $LOG_FILE${NC}"
+    log_message "Ping monitoring started - Hosts: ${HOSTS[*]}"
+fi
+
+echo -e "${BLUE}Press Ctrl+C to stop and see statistics${NC}"
+echo -e "${CYAN}========================================${NC}"
+
+# Main monitoring loop
+ping_count=0
+while true; do
+    for host in "${HOSTS[@]}"; do
+        ping_host "$host"
+    done
+    
+    ping_count=$((ping_count + 1))
+    
+    # Check if we've reached the count limit
+    if [ "$CONTINUOUS" = false ] && [ "$ping_count" -ge "$COUNT" ]; then
+        break
+    fi
+    
+    # Sleep between rounds (except on last iteration)
+    if [ "$CONTINUOUS" = true ] || [ "$ping_count" -lt "$COUNT" ]; then
+        sleep "$INTERVAL"
+    fi
+done
+
+# If we reach here, we've completed the specified count
+if [ "$CONTINUOUS" = false ]; then
+    echo
+    echo -e "${GREEN}✅ Completed $COUNT pings to each host${NC}"
+    display_statistics
+fi

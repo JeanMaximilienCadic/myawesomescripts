@@ -1,0 +1,521 @@
+#!/bin/bash
+
+# Smart Backup Script
+# Creates intelligent backups with compression, rotation, and verification
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Default configuration
+SOURCE_DIR=""
+BACKUP_DIR=""
+RETENTION_DAYS=30
+COMPRESSION="gzip"
+VERIFY_BACKUP=true
+EXCLUDE_PATTERNS=()
+LOG_FILE=""
+DRY_RUN=false
+INCREMENTAL=false
+SYNC_MODE=false
+
+# Function to display usage
+usage() {
+    echo "Smart Backup Tool"
+    echo
+    echo "Usage: $0 -s <source> -d <destination> [OPTIONS]"
+    echo
+    echo "Required:"
+    echo "  -s, --source DIR          Source directory to backup"
+    echo "  -d, --destination DIR     Backup destination directory"
+    echo
+    echo "Options:"
+    echo "  -r, --retention DAYS      Keep backups for N days (default: 30)"
+    echo "  -c, --compression TYPE    Compression: gzip, bzip2, xz, none (default: gzip)"
+    echo "  -e, --exclude PATTERN     Exclude pattern (can be used multiple times)"
+    echo "  -l, --log FILE            Log file path"
+    echo "  -i, --incremental         Incremental backup (link unchanged files)"
+    echo "  -y, --sync                Sync mode (mirror source to destination)"
+    echo "  -n, --dry-run             Show what would be done without executing"
+    echo "  -v, --no-verify           Skip backup verification"
+    echo "  -h, --help                Show this help message"
+    echo
+    echo "Examples:"
+    echo "  $0 -s /home/user -d /backup/home"
+    echo "  $0 -s /var/www -d /backup/web -e '*.log' -e 'tmp/*'"
+    echo "  $0 -s /data -d /backup/data -i -r 7 -c xz"
+    echo "  $0 -s /home -d /remote/backup -y --log backup.log"
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -s|--source)
+            SOURCE_DIR="$2"
+            shift 2
+            ;;
+        -d|--destination)
+            BACKUP_DIR="$2"
+            shift 2
+            ;;
+        -r|--retention)
+            RETENTION_DAYS="$2"
+            shift 2
+            ;;
+        -c|--compression)
+            COMPRESSION="$2"
+            shift 2
+            ;;
+        -e|--exclude)
+            EXCLUDE_PATTERNS+=("$2")
+            shift 2
+            ;;
+        -l|--log)
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        -i|--incremental)
+            INCREMENTAL=true
+            shift
+            ;;
+        -y|--sync)
+            SYNC_MODE=true
+            shift
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -v|--no-verify)
+            VERIFY_BACKUP=false
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+# Validate required arguments
+if [ -z "$SOURCE_DIR" ]; then
+    echo -e "${RED}❌ Error: Source directory is required${NC}"
+    usage
+fi
+
+if [ -z "$BACKUP_DIR" ]; then
+    echo -e "${RED}❌ Error: Backup destination is required${NC}"
+    usage
+fi
+
+# Validate source directory
+if [ ! -d "$SOURCE_DIR" ]; then
+    echo -e "${RED}❌ Error: Source directory '$SOURCE_DIR' does not exist${NC}"
+    exit 1
+fi
+
+# Create backup directory if it doesn't exist
+if [ ! -d "$BACKUP_DIR" ]; then
+    if [ "$DRY_RUN" = false ]; then
+        mkdir -p "$BACKUP_DIR"
+        echo -e "${YELLOW}📁 Created backup directory: $BACKUP_DIR${NC}"
+    else
+        echo -e "${YELLOW}[DRY RUN] Would create directory: $BACKUP_DIR${NC}"
+    fi
+fi
+
+# Function to log messages
+log_message() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    echo -e "$message"
+    if [ -n "$LOG_FILE" ]; then
+        echo "$timestamp - $(echo -e "$message" | sed 's/\x1b\[[0-9;]*m//g')" >> "$LOG_FILE"
+    fi
+}
+
+# Function to get directory size
+get_dir_size() {
+    du -sh "$1" 2>/dev/null | cut -f1 || echo "unknown"
+}
+
+# Function to build exclude options for rsync
+build_exclude_options() {
+    local exclude_opts=""
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        exclude_opts="$exclude_opts --exclude=$pattern"
+    done
+    echo "$exclude_opts"
+}
+
+# Function to perform sync backup
+sync_backup() {
+    local source="$1"
+    local destination="$2"
+    
+    log_message "${YELLOW}🔄 Starting sync backup...${NC}"
+    
+    # Build rsync command
+    local rsync_cmd="rsync -av --delete"
+    
+    # Add exclude patterns
+    local exclude_opts=$(build_exclude_options)
+    if [ -n "$exclude_opts" ]; then
+        rsync_cmd="$rsync_cmd $exclude_opts"
+    fi
+    
+    # Add dry run option
+    if [ "$DRY_RUN" = true ]; then
+        rsync_cmd="$rsync_cmd --dry-run"
+    fi
+    
+    rsync_cmd="$rsync_cmd $source/ $destination/"
+    
+    log_message "${BLUE}Command: $rsync_cmd${NC}"
+    
+    if eval "$rsync_cmd"; then
+        log_message "${GREEN}✅ Sync backup completed successfully${NC}"
+        return 0
+    else
+        log_message "${RED}❌ Sync backup failed${NC}"
+        return 1
+    fi
+}
+
+# Function to perform archive backup
+archive_backup() {
+    local source="$1"
+    local destination="$2"
+    
+    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local backup_name="backup_$timestamp"
+    local backup_path="$destination/$backup_name"
+    
+    log_message "${YELLOW}📦 Starting archive backup...${NC}"
+    
+    # Create backup directory
+    if [ "$DRY_RUN" = false ]; then
+        mkdir -p "$backup_path"
+    else
+        log_message "${YELLOW}[DRY RUN] Would create: $backup_path${NC}"
+    fi
+    
+    # Build tar command based on compression
+    local tar_cmd="tar"
+    local tar_file="$backup_path/data"
+    
+    case "$COMPRESSION" in
+        "gzip")
+            tar_cmd="$tar_cmd -czf $tar_file.tar.gz"
+            ;;
+        "bzip2")
+            tar_cmd="$tar_cmd -cjf $tar_file.tar.bz2"
+            ;;
+        "xz")
+            tar_cmd="$tar_cmd -cJf $tar_file.tar.xz"
+            ;;
+        "none")
+            tar_cmd="$tar_cmd -cf $tar_file.tar"
+            ;;
+        *)
+            log_message "${RED}❌ Error: Invalid compression type: $COMPRESSION${NC}"
+            return 1
+            ;;
+    esac
+    
+    # Add exclude patterns
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        tar_cmd="$tar_cmd --exclude=$pattern"
+    done
+    
+    tar_cmd="$tar_cmd -C $(dirname $source) $(basename $source)"
+    
+    log_message "${BLUE}Command: $tar_cmd${NC}"
+    
+    if [ "$DRY_RUN" = false ]; then
+        if eval "$tar_cmd"; then
+            # Create backup info file
+            cat > "$backup_path/backup_info.txt" << EOF
+Backup Information
+==================
+Source: $source
+Destination: $backup_path
+Date: $(date)
+Compression: $COMPRESSION
+Exclude patterns: ${EXCLUDE_PATTERNS[*]}
+Source size: $(get_dir_size "$source")
+EOF
+            log_message "${GREEN}✅ Archive backup completed successfully${NC}"
+            echo "$backup_path"
+            return 0
+        else
+            log_message "${RED}❌ Archive backup failed${NC}"
+            return 1
+        fi
+    else
+        log_message "${YELLOW}[DRY RUN] Would create archive: $tar_file${NC}"
+        echo "$backup_path"
+        return 0
+    fi
+}
+
+# Function to perform incremental backup
+incremental_backup() {
+    local source="$1"
+    local destination="$2"
+    
+    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+    local backup_name="incremental_$timestamp"
+    local backup_path="$destination/$backup_name"
+    
+    log_message "${YELLOW}🔄 Starting incremental backup...${NC}"
+    
+    # Find the latest backup for hard linking
+    local latest_backup=""
+    if [ -d "$destination" ]; then
+        latest_backup=$(find "$destination" -maxdepth 1 -type d -name "incremental_*" | sort | tail -1)
+    fi
+    
+    # Build rsync command
+    local rsync_cmd="rsync -av"
+    
+    # Add link-dest option if previous backup exists
+    if [ -n "$latest_backup" ]; then
+        rsync_cmd="$rsync_cmd --link-dest=$latest_backup"
+        log_message "${BLUE}Linking unchanged files to: $latest_backup${NC}"
+    fi
+    
+    # Add exclude patterns
+    local exclude_opts=$(build_exclude_options)
+    if [ -n "$exclude_opts" ]; then
+        rsync_cmd="$rsync_cmd $exclude_opts"
+    fi
+    
+    # Add dry run option
+    if [ "$DRY_RUN" = true ]; then
+        rsync_cmd="$rsync_cmd --dry-run"
+    fi
+    
+    rsync_cmd="$rsync_cmd $source/ $backup_path/"
+    
+    log_message "${BLUE}Command: $rsync_cmd${NC}"
+    
+    if [ "$DRY_RUN" = false ]; then
+        mkdir -p "$backup_path"
+    fi
+    
+    if eval "$rsync_cmd"; then
+        if [ "$DRY_RUN" = false ]; then
+            # Create backup info file
+            cat > "$backup_path/backup_info.txt" << EOF
+Incremental Backup Information
+==============================
+Source: $source
+Destination: $backup_path
+Date: $(date)
+Linked to: ${latest_backup:-"None (full backup)"}
+Exclude patterns: ${EXCLUDE_PATTERNS[*]}
+Source size: $(get_dir_size "$source")
+EOF
+        fi
+        log_message "${GREEN}✅ Incremental backup completed successfully${NC}"
+        echo "$backup_path"
+        return 0
+    else
+        log_message "${RED}❌ Incremental backup failed${NC}"
+        return 1
+    fi
+}
+
+# Function to verify backup integrity
+verify_backup() {
+    local backup_path="$1"
+    
+    if [ "$VERIFY_BACKUP" = false ]; then
+        return 0
+    fi
+    
+    log_message "${YELLOW}🔍 Verifying backup integrity...${NC}"
+    
+    if [ "$SYNC_MODE" = true ]; then
+        # For sync mode, compare file counts and sizes
+        local source_files=$(find "$SOURCE_DIR" -type f | wc -l)
+        local backup_files=$(find "$BACKUP_DIR" -type f | wc -l)
+        
+        if [ "$source_files" -eq "$backup_files" ]; then
+            log_message "${GREEN}✅ File count verification passed${NC}"
+            return 0
+        else
+            log_message "${RED}❌ File count mismatch: source=$source_files, backup=$backup_files${NC}"
+            return 1
+        fi
+    else
+        # For archive backups, check if archive files exist and are readable
+        local archive_files=$(find "$backup_path" -name "*.tar*" -o -name "*.tgz" | head -1)
+        
+        if [ -n "$archive_files" ]; then
+            if tar -tf "$archive_files" >/dev/null 2>&1; then
+                log_message "${GREEN}✅ Archive integrity verification passed${NC}"
+                return 0
+            else
+                log_message "${RED}❌ Archive integrity verification failed${NC}"
+                return 1
+            fi
+        else
+            log_message "${YELLOW}⚠️  No archive files found for verification${NC}"
+            return 0
+        fi
+    fi
+}
+
+# Function to clean old backups
+cleanup_old_backups() {
+    local destination="$1"
+    
+    if [ "$RETENTION_DAYS" -le 0 ]; then
+        return 0
+    fi
+    
+    log_message "${YELLOW}🗑️  Cleaning backups older than $RETENTION_DAYS days...${NC}"
+    
+    local old_backups
+    if [ "$SYNC_MODE" = true ]; then
+        # In sync mode, we don't typically clean the main backup
+        log_message "${BLUE}ℹ️  Sync mode: no automatic cleanup${NC}"
+        return 0
+    else
+        old_backups=$(find "$destination" -maxdepth 1 -type d -name "*backup_*" -o -name "*incremental_*" | \
+                     while read dir; do
+                         if [ -d "$dir" ] && [ "$dir" != "$destination" ]; then
+                             echo "$dir $(stat -c %Y "$dir")"
+                         fi
+                     done | \
+                     awk -v cutoff="$(date -d "$RETENTION_DAYS days ago" +%s)" '$2 < cutoff {print $1}')
+    fi
+    
+    if [ -n "$old_backups" ]; then
+        echo "$old_backups" | while read backup_dir; do
+            if [ "$DRY_RUN" = true ]; then
+                log_message "${YELLOW}[DRY RUN] Would remove: $backup_dir${NC}"
+            else
+                log_message "${YELLOW}Removing old backup: $backup_dir${NC}"
+                rm -rf "$backup_dir"
+            fi
+        done
+    else
+        log_message "${GREEN}✅ No old backups to clean${NC}"
+    fi
+}
+
+# Function to display backup summary
+display_summary() {
+    local backup_path="$1"
+    
+    echo
+    log_message "${CYAN}========================================${NC}"
+    log_message "${CYAN}         BACKUP SUMMARY                 ${NC}"
+    log_message "${CYAN}========================================${NC}"
+    log_message "${GREEN}Source:${NC} $SOURCE_DIR"
+    log_message "${GREEN}Destination:${NC} $BACKUP_DIR"
+    log_message "${GREEN}Type:${NC} $([ "$SYNC_MODE" = true ] && echo "Sync" || ([ "$INCREMENTAL" = true ] && echo "Incremental" || echo "Archive"))"
+    log_message "${GREEN}Compression:${NC} $COMPRESSION"
+    log_message "${GREEN}Retention:${NC} $RETENTION_DAYS days"
+    log_message "${GREEN}Source size:${NC} $(get_dir_size "$SOURCE_DIR")"
+    
+    if [ -n "$backup_path" ] && [ -d "$backup_path" ]; then
+        log_message "${GREEN}Backup size:${NC} $(get_dir_size "$backup_path")"
+    fi
+    
+    if [ ${#EXCLUDE_PATTERNS[@]} -gt 0 ]; then
+        log_message "${GREEN}Excluded:${NC} ${EXCLUDE_PATTERNS[*]}"
+    fi
+    
+    log_message "${GREEN}Completed:${NC} $(date)"
+    log_message "${CYAN}========================================${NC}"
+}
+
+# Main execution
+main() {
+    log_message "${BLUE}🚀 Starting Smart Backup${NC}"
+    
+    if [ "$DRY_RUN" = true ]; then
+        log_message "${YELLOW}⚠️  DRY RUN MODE - No changes will be made${NC}"
+    fi
+    
+    log_message "${BLUE}Source: $SOURCE_DIR ($(get_dir_size "$SOURCE_DIR"))${NC}"
+    log_message "${BLUE}Destination: $BACKUP_DIR${NC}"
+    
+    if [ -n "$LOG_FILE" ]; then
+        log_message "${BLUE}Logging to: $LOG_FILE${NC}"
+    fi
+    
+    echo
+    
+    # Perform backup based on mode
+    local backup_path=""
+    
+    if [ "$SYNC_MODE" = true ]; then
+        if sync_backup "$SOURCE_DIR" "$BACKUP_DIR"; then
+            backup_path="$BACKUP_DIR"
+        else
+            exit 1
+        fi
+    elif [ "$INCREMENTAL" = true ]; then
+        if backup_path=$(incremental_backup "$SOURCE_DIR" "$BACKUP_DIR"); then
+            true
+        else
+            exit 1
+        fi
+    else
+        if backup_path=$(archive_backup "$SOURCE_DIR" "$BACKUP_DIR"); then
+            true
+        else
+            exit 1
+        fi
+    fi
+    
+    # Verify backup
+    if ! verify_backup "$backup_path"; then
+        log_message "${RED}❌ Backup verification failed${NC}"
+        exit 1
+    fi
+    
+    # Clean old backups
+    cleanup_old_backups "$BACKUP_DIR"
+    
+    # Display summary
+    display_summary "$backup_path"
+    
+    log_message "${GREEN}🎉 Backup completed successfully!${NC}"
+}
+
+# Check dependencies
+missing_deps=()
+if ! command -v rsync >/dev/null 2>&1; then
+    missing_deps+=("rsync")
+fi
+
+if [ "$COMPRESSION" != "none" ] && ! command -v tar >/dev/null 2>&1; then
+    missing_deps+=("tar")
+fi
+
+if [ ${#missing_deps[@]} -gt 0 ]; then
+    echo -e "${RED}❌ Error: Missing required dependencies: ${missing_deps[*]}${NC}"
+    echo -e "${YELLOW}Install with: sudo apt-get install ${missing_deps[*]}${NC}"
+    exit 1
+fi
+
+# Run main function
+main

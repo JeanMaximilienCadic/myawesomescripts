@@ -1,0 +1,483 @@
+#!/bin/bash
+
+# File Organizer Script
+# Automatically organizes files by type, date, or custom rules
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Default configuration
+SOURCE_DIR=""
+ORGANIZE_BY="type"
+DRY_RUN=false
+RECURSIVE=false
+COPY_MODE=false
+CREATE_SUBDIRS=true
+LOG_FILE=""
+
+# File type mappings
+declare -A FILE_TYPES=(
+    # Images
+    ["jpg"]="Images"
+    ["jpeg"]="Images"
+    ["png"]="Images"
+    ["gif"]="Images"
+    ["bmp"]="Images"
+    ["tiff"]="Images"
+    ["svg"]="Images"
+    ["webp"]="Images"
+    ["ico"]="Images"
+    
+    # Documents
+    ["pdf"]="Documents"
+    ["doc"]="Documents"
+    ["docx"]="Documents"
+    ["txt"]="Documents"
+    ["rtf"]="Documents"
+    ["odt"]="Documents"
+    ["pages"]="Documents"
+    
+    # Spreadsheets
+    ["xls"]="Spreadsheets"
+    ["xlsx"]="Spreadsheets"
+    ["csv"]="Spreadsheets"
+    ["ods"]="Spreadsheets"
+    ["numbers"]="Spreadsheets"
+    
+    # Presentations
+    ["ppt"]="Presentations"
+    ["pptx"]="Presentations"
+    ["odp"]="Presentations"
+    ["key"]="Presentations"
+    
+    # Audio
+    ["mp3"]="Audio"
+    ["wav"]="Audio"
+    ["flac"]="Audio"
+    ["aac"]="Audio"
+    ["ogg"]="Audio"
+    ["m4a"]="Audio"
+    ["wma"]="Audio"
+    
+    # Video
+    ["mp4"]="Videos"
+    ["avi"]="Videos"
+    ["mkv"]="Videos"
+    ["mov"]="Videos"
+    ["wmv"]="Videos"
+    ["flv"]="Videos"
+    ["webm"]="Videos"
+    ["m4v"]="Videos"
+    
+    # Archives
+    ["zip"]="Archives"
+    ["rar"]="Archives"
+    ["7z"]="Archives"
+    ["tar"]="Archives"
+    ["gz"]="Archives"
+    ["bz2"]="Archives"
+    ["xz"]="Archives"
+    ["tgz"]="Archives"
+    
+    # Code
+    ["js"]="Code"
+    ["py"]="Code"
+    ["java"]="Code"
+    ["cpp"]="Code"
+    ["c"]="Code"
+    ["h"]="Code"
+    ["php"]="Code"
+    ["rb"]="Code"
+    ["go"]="Code"
+    ["rs"]="Code"
+    ["html"]="Code"
+    ["css"]="Code"
+    ["scss"]="Code"
+    ["json"]="Code"
+    ["xml"]="Code"
+    ["yaml"]="Code"
+    ["yml"]="Code"
+    
+    # Executables
+    ["exe"]="Executables"
+    ["msi"]="Executables"
+    ["deb"]="Executables"
+    ["rpm"]="Executables"
+    ["dmg"]="Executables"
+    ["app"]="Executables"
+    ["appimage"]="Executables"
+)
+
+# Function to display usage
+usage() {
+    echo "File Organizer Tool"
+    echo
+    echo "Usage: $0 -s <source_directory> [OPTIONS]"
+    echo
+    echo "Required:"
+    echo "  -s, --source DIR          Source directory to organize"
+    echo
+    echo "Options:"
+    echo "  -o, --organize-by TYPE    Organization method: type, date, size (default: type)"
+    echo "  -r, --recursive           Process subdirectories recursively"
+    echo "  -c, --copy                Copy files instead of moving them"
+    echo "  -n, --dry-run             Show what would be done without executing"
+    echo "  -l, --log FILE            Log operations to file"
+    echo "  --no-subdirs              Don't create subdirectories"
+    echo "  -h, --help                Show this help message"
+    echo
+    echo "Organization Types:"
+    echo "  type                      Organize by file type (Images, Documents, etc.)"
+    echo "  date                      Organize by modification date (YYYY/MM)"
+    echo "  size                      Organize by file size (Small, Medium, Large)"
+    echo
+    echo "Examples:"
+    echo "  $0 -s /home/user/Downloads"
+    echo "  $0 -s /tmp/files -o date -r"
+    echo "  $0 -s /data -o size -c --log organize.log"
+    echo "  $0 -s /files -n --dry-run"
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -s|--source)
+            SOURCE_DIR="$2"
+            shift 2
+            ;;
+        -o|--organize-by)
+            ORGANIZE_BY="$2"
+            shift 2
+            ;;
+        -r|--recursive)
+            RECURSIVE=true
+            shift
+            ;;
+        -c|--copy)
+            COPY_MODE=true
+            shift
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -l|--log)
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        --no-subdirs)
+            CREATE_SUBDIRS=false
+            shift
+            ;;
+        -h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown option: $1"
+            usage
+            ;;
+    esac
+done
+
+# Validate required arguments
+if [ -z "$SOURCE_DIR" ]; then
+    echo -e "${RED}❌ Error: Source directory is required${NC}"
+    usage
+fi
+
+if [ ! -d "$SOURCE_DIR" ]; then
+    echo -e "${RED}❌ Error: Source directory '$SOURCE_DIR' does not exist${NC}"
+    exit 1
+fi
+
+# Validate organize-by option
+if [[ ! "$ORGANIZE_BY" =~ ^(type|date|size)$ ]]; then
+    echo -e "${RED}❌ Error: Invalid organize-by option. Must be: type, date, or size${NC}"
+    exit 1
+fi
+
+# Function to log messages
+log_message() {
+    local message="$1"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    echo -e "$message"
+    if [ -n "$LOG_FILE" ]; then
+        echo "$timestamp - $(echo -e "$message" | sed 's/\x1b\[[0-9;]*m//g')" >> "$LOG_FILE"
+    fi
+}
+
+# Function to get file extension
+get_file_extension() {
+    local filename="$1"
+    echo "${filename##*.}" | tr '[:upper:]' '[:lower:]'
+}
+
+# Function to get file category by type
+get_file_category_by_type() {
+    local file="$1"
+    local extension=$(get_file_extension "$file")
+    
+    if [ -n "${FILE_TYPES[$extension]}" ]; then
+        echo "${FILE_TYPES[$extension]}"
+    else
+        echo "Others"
+    fi
+}
+
+# Function to get file category by date
+get_file_category_by_date() {
+    local file="$1"
+    local mod_date=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null)
+    local year_month=$(date -d "@$mod_date" +"%Y/%m" 2>/dev/null || date -r "$mod_date" +"%Y/%m" 2>/dev/null)
+    echo "$year_month"
+}
+
+# Function to get file category by size
+get_file_category_by_size() {
+    local file="$1"
+    local size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null)
+    
+    if [ "$size" -lt 1048576 ]; then  # < 1MB
+        echo "Small"
+    elif [ "$size" -lt 104857600 ]; then  # < 100MB
+        echo "Medium"
+    else
+        echo "Large"
+    fi
+}
+
+# Function to get target directory for file
+get_target_directory() {
+    local file="$1"
+    local base_dir="$SOURCE_DIR"
+    
+    case "$ORGANIZE_BY" in
+        "type")
+            local category=$(get_file_category_by_type "$file")
+            ;;
+        "date")
+            local category=$(get_file_category_by_date "$file")
+            ;;
+        "size")
+            local category=$(get_file_category_by_size "$file")
+            ;;
+    esac
+    
+    if [ "$CREATE_SUBDIRS" = true ]; then
+        echo "$base_dir/$category"
+    else
+        echo "$base_dir"
+    fi
+}
+
+# Function to move or copy file
+move_or_copy_file() {
+    local source_file="$1"
+    local target_dir="$2"
+    local filename=$(basename "$source_file")
+    local target_file="$target_dir/$filename"
+    
+    # Create target directory if it doesn't exist
+    if [ "$DRY_RUN" = false ] && [ ! -d "$target_dir" ]; then
+        mkdir -p "$target_dir"
+        log_message "${BLUE}📁 Created directory: $target_dir${NC}"
+    fi
+    
+    # Handle file conflicts
+    local counter=1
+    local base_name="${filename%.*}"
+    local extension="${filename##*.}"
+    
+    while [ -e "$target_file" ]; do
+        if [ "$base_name" = "$extension" ]; then
+            # File has no extension
+            target_file="$target_dir/${base_name}_$counter"
+        else
+            target_file="$target_dir/${base_name}_$counter.$extension"
+        fi
+        counter=$((counter + 1))
+    done
+    
+    # Perform the operation
+    if [ "$DRY_RUN" = true ]; then
+        if [ "$COPY_MODE" = true ]; then
+            log_message "${YELLOW}[DRY RUN] Would copy: $source_file → $target_file${NC}"
+        else
+            log_message "${YELLOW}[DRY RUN] Would move: $source_file → $target_file${NC}"
+        fi
+    else
+        if [ "$COPY_MODE" = true ]; then
+            if cp "$source_file" "$target_file"; then
+                log_message "${GREEN}📋 Copied: $filename → $target_dir${NC}"
+                return 0
+            else
+                log_message "${RED}❌ Failed to copy: $filename${NC}"
+                return 1
+            fi
+        else
+            if mv "$source_file" "$target_file"; then
+                log_message "${GREEN}📦 Moved: $filename → $target_dir${NC}"
+                return 0
+            else
+                log_message "${RED}❌ Failed to move: $filename${NC}"
+                return 1
+            fi
+        fi
+    fi
+}
+
+# Function to process files
+process_files() {
+    local search_dir="$1"
+    local find_options="-maxdepth 1"
+    
+    if [ "$RECURSIVE" = true ]; then
+        find_options=""
+    fi
+    
+    local total_files=0
+    local processed_files=0
+    local failed_files=0
+    
+    # Count total files first
+    while IFS= read -r -d '' file; do
+        if [ -f "$file" ]; then
+            total_files=$((total_files + 1))
+        fi
+    done < <(find "$search_dir" $find_options -type f -print0 2>/dev/null)
+    
+    log_message "${BLUE}Found $total_files files to process${NC}"
+    echo
+    
+    # Process each file
+    while IFS= read -r -d '' file; do
+        if [ -f "$file" ]; then
+            local target_dir=$(get_target_directory "$file")
+            local current_dir=$(dirname "$file")
+            
+            # Skip if file is already in the target directory
+            if [ "$current_dir" = "$target_dir" ]; then
+                continue
+            fi
+            
+            if move_or_copy_file "$file" "$target_dir"; then
+                processed_files=$((processed_files + 1))
+            else
+                failed_files=$((failed_files + 1))
+            fi
+        fi
+    done < <(find "$search_dir" $find_options -type f -print0 2>/dev/null)
+    
+    # Display summary
+    echo
+    log_message "${CYAN}========================================${NC}"
+    log_message "${CYAN}         ORGANIZATION SUMMARY           ${NC}"
+    log_message "${CYAN}========================================${NC}"
+    log_message "${GREEN}Total files found:${NC} $total_files"
+    log_message "${GREEN}Successfully processed:${NC} $processed_files"
+    
+    if [ "$failed_files" -gt 0 ]; then
+        log_message "${RED}Failed:${NC} $failed_files"
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        log_message "${YELLOW}Mode:${NC} Dry run (no changes made)"
+    else
+        log_message "${GREEN}Mode:${NC} $([ "$COPY_MODE" = true ] && echo "Copy" || echo "Move")"
+    fi
+    
+    log_message "${GREEN}Organization type:${NC} $ORGANIZE_BY"
+    log_message "${GREEN}Recursive:${NC} $([ "$RECURSIVE" = true ] && echo "Yes" || echo "No")"
+    log_message "${CYAN}========================================${NC}"
+}
+
+# Function to show directory structure
+show_directory_structure() {
+    local dir="$1"
+    
+    log_message "${CYAN}📂 Directory structure after organization:${NC}"
+    
+    if command -v tree >/dev/null 2>&1; then
+        tree -L 2 "$dir" 2>/dev/null || find "$dir" -type d | head -20 | sort
+    else
+        find "$dir" -type d | head -20 | sort | while read subdir; do
+            local file_count=$(find "$subdir" -maxdepth 1 -type f | wc -l)
+            echo "  $subdir ($file_count files)"
+        done
+    fi
+    echo
+}
+
+# Function to create undo script
+create_undo_script() {
+    if [ "$DRY_RUN" = true ] || [ "$COPY_MODE" = true ]; then
+        return 0
+    fi
+    
+    local undo_file="$SOURCE_DIR/undo_organization.sh"
+    
+    cat > "$undo_file" << 'EOF'
+#!/bin/bash
+# Undo script for file organization
+# This script moves files back to the source directory root
+
+echo "This would undo the file organization."
+echo "WARNING: This will move all files back to the root directory!"
+read -p "Are you sure? (y/N): " -n 1 -r
+echo
+
+if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    exit 1
+fi
+
+find . -mindepth 2 -type f -exec mv {} . \;
+find . -mindepth 1 -type d -empty -delete
+
+echo "Organization undone."
+EOF
+    
+    chmod +x "$undo_file"
+    log_message "${BLUE}💾 Created undo script: $undo_file${NC}"
+}
+
+# Main execution
+main() {
+    log_message "${BLUE}🗂️  File Organizer Started${NC}"
+    log_message "${BLUE}Source directory: $SOURCE_DIR${NC}"
+    log_message "${BLUE}Organization method: $ORGANIZE_BY${NC}"
+    
+    if [ "$DRY_RUN" = true ]; then
+        log_message "${YELLOW}⚠️  DRY RUN MODE - No changes will be made${NC}"
+    fi
+    
+    if [ -n "$LOG_FILE" ]; then
+        log_message "${BLUE}Logging to: $LOG_FILE${NC}"
+    fi
+    
+    echo
+    
+    # Process files
+    process_files "$SOURCE_DIR"
+    
+    # Show directory structure
+    if [ "$DRY_RUN" = false ]; then
+        show_directory_structure "$SOURCE_DIR"
+        create_undo_script
+    fi
+    
+    log_message "${GREEN}🎉 File organization completed!${NC}"
+}
+
+# Run main function
+main

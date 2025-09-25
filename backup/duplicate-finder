@@ -1,0 +1,484 @@
+#!/bin/bash
+
+# Duplicate File Finder Script
+# Finds and optionally removes duplicate files based on content hash
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+MAGENTA='\033[0;35m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Default configuration
+SEARCH_DIRS=()
+HASH_ALGORITHM="md5"
+MIN_SIZE=0
+MAX_SIZE=""
+DRY_RUN=false
+INTERACTIVE=false
+DELETE_DUPLICATES=false
+OUTPUT_FILE=""
+RECURSIVE=true
+INCLUDE_PATTERNS=()
+EXCLUDE_PATTERNS=()
+
+# Function to display usage
+usage() {
+    echo "Duplicate File Finder"
+    echo
+    echo "Usage: $0 [OPTIONS] <directory1> [directory2] ..."
+    echo
+    echo "Options:"
+    echo "  -a, --algorithm ALGO      Hash algorithm: md5, sha1, sha256 (default: md5)"
+    echo "  -s, --min-size SIZE       Minimum file size to check (e.g., 1M, 100K)"
+    echo "  -S, --max-size SIZE       Maximum file size to check (e.g., 1G, 100M)"
+    echo "  -i, --interactive         Interactive mode for duplicate handling"
+    echo "  -d, --delete              Delete duplicates (keeps first occurrence)"
+    echo "  -n, --dry-run             Show what would be done without executing"
+    echo "  -o, --output FILE         Save results to file"
+    echo "  -r, --no-recursive        Don't search subdirectories"
+    echo "  --include PATTERN         Include files matching pattern (can be used multiple times)"
+    echo "  --exclude PATTERN         Exclude files matching pattern (can be used multiple times)"
+    echo "  -h, --help                Show this help message"
+    echo
+    echo "Size Examples:"
+    echo "  100          100 bytes"
+    echo "  1K, 1k       1 kilobyte"
+    echo "  1M, 1m       1 megabyte"
+    echo "  1G, 1g       1 gigabyte"
+    echo
+    echo "Examples:"
+    echo "  $0 /home/user/Pictures"
+    echo "  $0 -s 1M -a sha256 /data /backup"
+    echo "  $0 --include '*.jpg' --exclude '*thumbnail*' /photos"
+    echo "  $0 -i -d --dry-run /downloads"
+    exit 0
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -a|--algorithm)
+            HASH_ALGORITHM="$2"
+            shift 2
+            ;;
+        -s|--min-size)
+            MIN_SIZE="$2"
+            shift 2
+            ;;
+        -S|--max-size)
+            MAX_SIZE="$2"
+            shift 2
+            ;;
+        -i|--interactive)
+            INTERACTIVE=true
+            shift
+            ;;
+        -d|--delete)
+            DELETE_DUPLICATES=true
+            shift
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -o|--output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -r|--no-recursive)
+            RECURSIVE=false
+            shift
+            ;;
+        --include)
+            INCLUDE_PATTERNS+=("$2")
+            shift 2
+            ;;
+        --exclude)
+            EXCLUDE_PATTERNS+=("$2")
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            usage
+            ;;
+        *)
+            SEARCH_DIRS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Validate arguments
+if [ ${#SEARCH_DIRS[@]} -eq 0 ]; then
+    echo -e "${RED}❌ Error: At least one directory is required${NC}"
+    usage
+fi
+
+# Validate directories
+for dir in "${SEARCH_DIRS[@]}"; do
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}❌ Error: Directory '$dir' does not exist${NC}"
+        exit 1
+    fi
+done
+
+# Validate hash algorithm
+case "$HASH_ALGORITHM" in
+    md5|sha1|sha256)
+        if ! command -v "${HASH_ALGORITHM}sum" >/dev/null 2>&1; then
+            echo -e "${RED}❌ Error: ${HASH_ALGORITHM}sum command not found${NC}"
+            exit 1
+        fi
+        ;;
+    *)
+        echo -e "${RED}❌ Error: Unsupported hash algorithm: $HASH_ALGORITHM${NC}"
+        exit 1
+        ;;
+esac
+
+# Function to convert size to bytes
+size_to_bytes() {
+    local size="$1"
+    local number
+    local unit
+    
+    if [[ "$size" =~ ^([0-9]+)([KkMmGgTt]?)$ ]]; then
+        number="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[2]}"
+        
+        case "${unit,,}" in
+            k) echo $((number * 1024)) ;;
+            m) echo $((number * 1024 * 1024)) ;;
+            g) echo $((number * 1024 * 1024 * 1024)) ;;
+            t) echo $((number * 1024 * 1024 * 1024 * 1024)) ;;
+            *) echo "$number" ;;
+        esac
+    else
+        echo "0"
+    fi
+}
+
+# Convert size limits to bytes
+MIN_SIZE_BYTES=$(size_to_bytes "$MIN_SIZE")
+if [ -n "$MAX_SIZE" ]; then
+    MAX_SIZE_BYTES=$(size_to_bytes "$MAX_SIZE")
+else
+    MAX_SIZE_BYTES=""
+fi
+
+# Function to check if file matches size criteria
+check_file_size() {
+    local file="$1"
+    local size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo "0")
+    
+    if [ "$size" -lt "$MIN_SIZE_BYTES" ]; then
+        return 1
+    fi
+    
+    if [ -n "$MAX_SIZE_BYTES" ] && [ "$size" -gt "$MAX_SIZE_BYTES" ]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to check if file matches include/exclude patterns
+check_file_patterns() {
+    local file="$1"
+    local filename=$(basename "$file")
+    
+    # Check exclude patterns first
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        if [[ "$filename" == $pattern ]]; then
+            return 1
+        fi
+    done
+    
+    # If include patterns are specified, file must match at least one
+    if [ ${#INCLUDE_PATTERNS[@]} -gt 0 ]; then
+        for pattern in "${INCLUDE_PATTERNS[@]}"; do
+            if [[ "$filename" == $pattern ]]; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function to calculate file hash
+calculate_hash() {
+    local file="$1"
+    "${HASH_ALGORITHM}sum" "$file" | awk '{print $1}'
+}
+
+# Function to format file size
+format_size() {
+    local size="$1"
+    
+    if [ "$size" -lt 1024 ]; then
+        echo "${size}B"
+    elif [ "$size" -lt $((1024 * 1024)) ]; then
+        echo "$((size / 1024))KB"
+    elif [ "$size" -lt $((1024 * 1024 * 1024)) ]; then
+        echo "$((size / 1024 / 1024))MB"
+    else
+        echo "$((size / 1024 / 1024 / 1024))GB"
+    fi
+}
+
+# Function to display file info
+display_file_info() {
+    local file="$1"
+    local size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo "0")
+    local mod_time=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null)
+    local formatted_size=$(format_size "$size")
+    local formatted_time=$(date -d "@$mod_time" '+%Y-%m-%d %H:%M' 2>/dev/null || date -r "$mod_time" '+%Y-%m-%d %H:%M' 2>/dev/null)
+    
+    echo "    $file (${formatted_size}, ${formatted_time})"
+}
+
+# Function to handle duplicate group
+handle_duplicate_group() {
+    local hash="$1"
+    shift
+    local files=("$@")
+    
+    echo -e "${YELLOW}🔍 Found ${#files[@]} duplicates with hash: $hash${NC}"
+    
+    # Display all files in the group
+    for file in "${files[@]}"; do
+        display_file_info "$file"
+    done
+    
+    if [ "$OUTPUT_FILE" ]; then
+        echo "Hash: $hash" >> "$OUTPUT_FILE"
+        for file in "${files[@]}"; do
+            echo "  $file" >> "$OUTPUT_FILE"
+        done
+        echo "" >> "$OUTPUT_FILE"
+    fi
+    
+    # Handle deletion/interactive mode
+    if [ "$DELETE_DUPLICATES" = true ] || [ "$INTERACTIVE" = true ]; then
+        local keep_file="${files[0]}"
+        local delete_files=("${files[@]:1}")
+        
+        if [ "$INTERACTIVE" = true ]; then
+            echo -e "${CYAN}Select action:${NC}"
+            echo "  1) Keep first file: $keep_file"
+            echo "  2) Choose which file to keep"
+            echo "  3) Skip this group"
+            
+            read -p "Choice (1-3): " choice
+            
+            case "$choice" in
+                2)
+                    echo -e "${CYAN}Select file to keep:${NC}"
+                    for i in "${!files[@]}"; do
+                        echo "  $((i+1))) ${files[i]}"
+                    done
+                    read -p "File number: " file_num
+                    
+                    if [[ "$file_num" =~ ^[0-9]+$ ]] && [ "$file_num" -ge 1 ] && [ "$file_num" -le ${#files[@]} ]; then
+                        keep_file="${files[$((file_num-1))]}"
+                        delete_files=()
+                        for i in "${!files[@]}"; do
+                            if [ "$i" -ne $((file_num-1)) ]; then
+                                delete_files+=("${files[i]}")
+                            fi
+                        done
+                    else
+                        echo -e "${RED}Invalid selection. Skipping group.${NC}"
+                        return
+                    fi
+                    ;;
+                3)
+                    echo -e "${BLUE}Skipping group.${NC}"
+                    return
+                    ;;
+                1|*)
+                    # Use default (first file)
+                    ;;
+            esac
+        fi
+        
+        # Delete duplicate files
+        for file in "${delete_files[@]}"; do
+            if [ "$DRY_RUN" = true ]; then
+                echo -e "${YELLOW}[DRY RUN] Would delete: $file${NC}"
+            else
+                if rm -f "$file"; then
+                    echo -e "${GREEN}🗑️  Deleted: $file${NC}"
+                else
+                    echo -e "${RED}❌ Failed to delete: $file${NC}"
+                fi
+            fi
+        done
+        
+        echo -e "${GREEN}✓ Kept: $keep_file${NC}"
+    fi
+    
+    echo
+}
+
+# Function to find and process duplicates
+find_duplicates() {
+    local temp_file=$(mktemp)
+    local hash_file=$(mktemp)
+    
+    echo -e "${BLUE}🔍 Scanning for files...${NC}"
+    
+    # Build find command
+    local find_cmd="find"
+    for dir in "${SEARCH_DIRS[@]}"; do
+        find_cmd="$find_cmd \"$dir\""
+    done
+    
+    if [ "$RECURSIVE" = false ]; then
+        find_cmd="$find_cmd -maxdepth 1"
+    fi
+    
+    find_cmd="$find_cmd -type f"
+    
+    # Get list of files
+    eval "$find_cmd" > "$temp_file"
+    
+    local total_files=$(wc -l < "$temp_file")
+    echo -e "${BLUE}Found $total_files files to analyze${NC}"
+    
+    # Filter files and calculate hashes
+    local processed=0
+    local duplicates_found=0
+    local space_wasted=0
+    
+    echo -e "${BLUE}📊 Calculating hashes...${NC}"
+    
+    while IFS= read -r file; do
+        processed=$((processed + 1))
+        
+        # Show progress
+        if [ $((processed % 100)) -eq 0 ]; then
+            echo -e "${CYAN}Progress: $processed/$total_files files processed${NC}"
+        fi
+        
+        # Check if file exists and is readable
+        if [ ! -r "$file" ]; then
+            continue
+        fi
+        
+        # Check size criteria
+        if ! check_file_size "$file"; then
+            continue
+        fi
+        
+        # Check include/exclude patterns
+        if ! check_file_patterns "$file"; then
+            continue
+        fi
+        
+        # Calculate hash and add to hash file
+        local hash=$(calculate_hash "$file")
+        local size=$(stat -c %s "$file" 2>/dev/null || stat -f %z "$file" 2>/dev/null || echo "0")
+        echo "$hash|$size|$file" >> "$hash_file"
+        
+    done < "$temp_file"
+    
+    echo -e "${GREEN}✓ Processed $processed files${NC}"
+    echo
+    
+    # Find duplicates
+    echo -e "${BLUE}🔍 Analyzing for duplicates...${NC}"
+    
+    # Group files by hash
+    sort "$hash_file" | while IFS='|' read -r hash size file; do
+        echo "$hash $file"
+    done | sort | uniq -d -w 32 | cut -d' ' -f1 | sort -u | while read -r dup_hash; do
+        # Get all files with this hash
+        local dup_files=()
+        local dup_size=0
+        
+        while IFS='|' read -r hash size file; do
+            if [ "$hash" = "$dup_hash" ]; then
+                dup_files+=("$file")
+                dup_size="$size"
+            fi
+        done < "$hash_file"
+        
+        if [ ${#dup_files[@]} -gt 1 ]; then
+            duplicates_found=$((duplicates_found + ${#dup_files[@]} - 1))
+            space_wasted=$((space_wasted + dup_size * (${#dup_files[@]} - 1)))
+            handle_duplicate_group "$dup_hash" "${dup_files[@]}"
+        fi
+    done
+    
+    # Summary
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${CYAN}         DUPLICATE SCAN SUMMARY         ${NC}"
+    echo -e "${CYAN}========================================${NC}"
+    echo -e "${GREEN}Files scanned:${NC} $processed"
+    echo -e "${GREEN}Duplicate files found:${NC} $duplicates_found"
+    echo -e "${GREEN}Space wasted by duplicates:${NC} $(format_size $space_wasted)"
+    echo -e "${GREEN}Hash algorithm:${NC} $HASH_ALGORITHM"
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}Mode:${NC} Dry run (no files deleted)"
+    elif [ "$DELETE_DUPLICATES" = true ]; then
+        echo -e "${GREEN}Mode:${NC} Delete duplicates"
+    else
+        echo -e "${BLUE}Mode:${NC} Report only"
+    fi
+    
+    if [ -n "$OUTPUT_FILE" ]; then
+        echo -e "${GREEN}Results saved to:${NC} $OUTPUT_FILE"
+    fi
+    
+    echo -e "${CYAN}========================================${NC}"
+    
+    # Cleanup
+    rm -f "$temp_file" "$hash_file"
+}
+
+# Main execution
+main() {
+    echo -e "${BLUE}🔍 Duplicate File Finder Started${NC}"
+    echo -e "${BLUE}Search directories: ${SEARCH_DIRS[*]}${NC}"
+    echo -e "${BLUE}Hash algorithm: $HASH_ALGORITHM${NC}"
+    echo -e "${BLUE}Min size: $(format_size $MIN_SIZE_BYTES)${NC}"
+    
+    if [ -n "$MAX_SIZE_BYTES" ]; then
+        echo -e "${BLUE}Max size: $(format_size $MAX_SIZE_BYTES)${NC}"
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        echo -e "${YELLOW}⚠️  DRY RUN MODE - No files will be deleted${NC}"
+    fi
+    
+    if [ -n "$OUTPUT_FILE" ]; then
+        echo -e "${BLUE}Output file: $OUTPUT_FILE${NC}"
+        echo "Duplicate File Finder Results" > "$OUTPUT_FILE"
+        echo "Date: $(date)" >> "$OUTPUT_FILE"
+        echo "Directories: ${SEARCH_DIRS[*]}" >> "$OUTPUT_FILE"
+        echo "Algorithm: $HASH_ALGORITHM" >> "$OUTPUT_FILE"
+        echo "" >> "$OUTPUT_FILE"
+    fi
+    
+    echo
+    
+    find_duplicates
+    
+    echo -e "${GREEN}🎉 Duplicate scan completed!${NC}"
+}
+
+# Run main function
+main

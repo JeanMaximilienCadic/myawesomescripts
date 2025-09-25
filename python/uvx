@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# UV Package Manager Wrapper Script
+# This script provides a convenient wrapper around the 'uv' package manager
+# for installing Python packages system-wide with the --break-system-packages flag.
+#
+# Usage: ./uvx <package_name> [additional_packages...]
+# Example: ./uvx requests pandas numpy
+
+sudo uv pip install --system --break-system-packages "$@";
