@@ -1,0 +1,115 @@
+vmType: "qemu"
+arch: "x86_64"
+
+images:
+- location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+  arch: "x86_64"
+
+cpus: 10
+memory: "10GiB"
+
+# Use reverse-sshfs to handle UID mismatch (Host: 501, Guest: 1000)
+mountType: "reverse-sshfs"
+
+mounts:
+- location: "~"
+  mountPoint: "/mnt/hdd"
+  writable: true
+- location: "~/srv/code"
+  mountPoint: "/srv/code"
+  writable: true
+- location: "~/.aws"
+  mountPoint: "/home/foo/.aws"
+  writable: true
+
+ssh:
+  localPort: 2201
+  loadDotSSHPubKeys: true
+
+user:
+  name: "foo"
+  uid: 1000
+  home: "/home/foo"
+
+# Disable default containerd to avoid startup hangs
+containerd:
+  system: false
+  user: false
+
+provision:
+# 1. System-level setup: SSH keys, Docker, Dependencies, Path Fixes
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    
+    # --- Fix macOS Paths (Symlink /Users/jcadic -> /mnt/hdd) ---
+    mkdir -p /Users
+    # Remove if exists (e.g. empty dir)
+    rm -rf /Users/jcadic
+    ln -s /mnt/hdd /Users/jcadic
+
+    # --- SSH Host Key Persistence ---
+    SSH_KEY_DIR="/var/lib/lima-ssh-keys"
+    mkdir -p "$SSH_KEY_DIR"
+    if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then ssh-keygen -A; fi
+    for key_type in rsa ecdsa ed25519; do
+      if [ ! -f "$SSH_KEY_DIR/ssh_host_${key_type}_key" ] && [ -f "/etc/ssh/ssh_host_${key_type}_key" ]; then
+        cp "/etc/ssh/ssh_host_${key_type}_key" "$SSH_KEY_DIR/"
+        cp "/etc/ssh/ssh_host_${key_type}_key.pub" "$SSH_KEY_DIR/" 2>/dev/null || true
+        chmod 600 "$SSH_KEY_DIR/ssh_host_${key_type}_key"
+      fi
+    done
+    for key_type in rsa ecdsa ed25519; do
+      if [ -f "$SSH_KEY_DIR/ssh_host_${key_type}_key" ]; then
+        cp "$SSH_KEY_DIR/ssh_host_${key_type}_key" "/etc/ssh/"
+        cp "$SSH_KEY_DIR/ssh_host_${key_type}_key.pub" "/etc/ssh/" 2>/dev/null || true
+        chmod 600 "/etc/ssh/ssh_host_${key_type}_key"
+        chmod 644 "/etc/ssh/ssh_host_${key_type}_key.pub" 2>/dev/null || true
+      fi
+    done
+    systemctl restart sshd 2>/dev/null || service ssh restart 2>/dev/null || true
+
+    # --- Install Docker ---
+    apt-get update
+    apt-get install -y ca-certificates curl
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
+
+    echo \
+      "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+      $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+      tee /etc/apt/sources.list.d/docker.list > /dev/null
+    apt-get update
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # --- Install Build Dependencies for Rust/Cargo ---
+    apt-get install -y build-essential
+
+# 2. User-level setup: Permissions, Tools (uv, cargo, rsbuild)
+- mode: user
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    
+    # --- SSH Permissions ---
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
+    touch ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+
+    # --- Install uv ---
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+
+    # --- Install Rust & Cargo ---
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    . "$HOME/.cargo/env"
+    cargo install rsbuild
+
+# 3. Final System Adjustments (Group membership)
+- mode: system
+  script: |
+    #!/bin/bash
+    set -eux -o pipefail
+    usermod -aG docker foo
