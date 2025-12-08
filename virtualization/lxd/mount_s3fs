@@ -1,0 +1,39 @@
+#!/bin/bash
+
+# Define the local mount point and bucket name
+: "${BUCKET_NAME:?Error: BUCKET_NAME environment variable is not set}"
+: "${API_STORAGE:?Error: API_STORAGE environment variable is not set}"
+: "${AWS_ACCESS_KEY_ID:?Error: AWS_ACCESS_KEY_ID environment variable is not set}"
+: "${AWS_SECRET_ACCESS_KEY:?Error: AWS_SECRET_ACCESS_KEY environment variable is not set}"
+# Use the existing VERBOSE setting if defined; otherwise, default to false
+VERBOSE=${VERBOSE:-false}
+
+MOUNT_BASE_DIR="/srv"
+# Define the mount point and bucket details
+MOUNT_POINT="$MOUNT_BASE_DIR/$BUCKET_NAME"
+PWD_FILE="$HOME/.passwd-s3fs"
+S3FS_OPTIONS="-o passwd_file=$PWD_FILE -o url=$API_STORAGE -o use_path_request_style -o nonempty"
+
+# Create the mount directory if it doesn't exist
+if [ ! -d "$MOUNT_POINT" ]; then
+    log "Creating mount directory at $MOUNT_POINT..."
+    mkdir -p "$MOUNT_POINT"
+fi
+    
+# Check if the folder is already mounted
+if mount | grep -q "$MOUNT_POINT"; then
+    echo "The folder $MOUNT_POINT is already mounted."
+else
+    echo "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" > $PWD_FILE
+    chmod 600 $PWD_FILE
+    echo "The folder $MOUNT_POINT is not mounted. Mounting now..."
+    # Run the s3fs command to mount the bucket
+    s3fs $BUCKET_NAME $MOUNT_POINT $S3FS_OPTIONS
+
+    # Check if mounting was successful
+    if mount | grep -q "$MOUNT_POINT"; then
+        echo "Successfully mounted $BUCKET_NAME to $MOUNT_POINT."
+    else
+        echo "Failed to mount $BUCKET_NAME to $MOUNT_POINT."
+    fi
+fi
