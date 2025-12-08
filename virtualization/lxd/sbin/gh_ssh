@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Define the known_hosts file path
+KNOWN_HOSTS_FILE="$HOME/.ssh/known_hosts"
+
+# Check if 'github.com ssh-ed25519' is present in known_hosts
+if ! grep -q "github.com ssh-ed25519" "$KNOWN_HOSTS_FILE"; then
+    gh ssh-key add $HOME/.ssh/id_rsa.pub
+    ssh-keyscan -t ed25519 github.com >> "$KNOWN_HOSTS_FILE"
+fi

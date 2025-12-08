@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Check if GitHub CLI is already authenticated
+if gh auth status 2>/dev/null | grep -q 'Logged in to'; then
+    echo "Already authenticated to GitHub."
+else
+    echo "Not authenticated. Logging in..."
+    echo "$GITHUB_TOKEN" | gh auth login --with-token
+    if [ $? -eq 0 ]; then
+        echo "Successfully authenticated to GitHub."
+    else
+        echo "Failed to authenticate."
+    fi
+fi
