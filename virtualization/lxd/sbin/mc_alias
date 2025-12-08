@@ -1,0 +1,12 @@
+#!/bin/bash
+MC_ALIAS="${MC_ALIAS:-pvt}"
+VERBOSE="${VERBOSE:-false}"
+
+if mc alias list "$MC_ALIAS" >/dev/null 2>&1; then
+    if [ "$VERBOSE" = true ]; then
+        echo "MinIO alias '$MC_ALIAS' already exists. Skipping..."
+    fi
+else
+    mc alias set "$MC_ALIAS" "${API_STORAGE}" "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}"
+    echo "MinIO alias '$MC_ALIAS' created."
+fi
