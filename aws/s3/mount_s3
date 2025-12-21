@@ -1,0 +1,58 @@
+#!/bin/bash
+
+# --- Function: mount_bucket ---
+# Parameters:
+# $1: Remote Name (e.g., s3:videos)
+# $2: Local Mount Point (e.g., $HOME/videos)
+# ------------------------------
+mount_bucket() {
+    local REMOTE="$1"
+    local MOUNT_POINT="$2"
+    local LOG_FILE="$HOME/rclone_$(echo $REMOTE | tr ':' '_').log"
+
+    echo "---------------------------------------------------"
+    echo "Target: $REMOTE -> $MOUNT_POINT"
+
+    # 1. Ensure the mount point directory exists
+    if [ ! -d "$MOUNT_POINT" ]; then
+        echo "Creating mount point directory: $MOUNT_POINT"
+        mkdir -p "$MOUNT_POINT"
+    fi
+
+    # 2. Check if already mounted
+    if mount | grep -q "$MOUNT_POINT"; then
+        echo "Error: $MOUNT_POINT is already mounted. Skipping."
+        return 1
+    fi
+
+    # 3. Clean up any stale rclone processes for this specific mount
+    pkill -f "rclone mount $REMOTE $MOUNT_POINT" >/dev/null 2>&1
+
+    echo "Mounting..."
+
+    # 4. Execute rclone
+    rclone mount "$REMOTE" "$MOUNT_POINT" \
+        --vfs-cache-mode writes \
+        --vfs-read-chunk-size 128M \
+        --s3-provider Other \
+        --s3-force-path-style \
+        --no-modtime \
+        --log-file "$LOG_FILE" \
+        --log-level DEBUG \
+        --daemon
+
+    # 5. Wait and verify
+    if mount | grep -q "$MOUNT_POINT"; then
+        echo "✅ Success: $REMOTE is mounted at $MOUNT_POINT"
+    else
+        echo "❌ Failure: Mount failed for $REMOTE."
+        echo "Check log: $LOG_FILE"
+    fi
+}
+
+# --- Main Execution ---
+ 
+# Example: Mount another bucket (e.g., audio)
+# mount_bucket "s3:audio" "$HOME/audio"
+
+# ---------------------------------------------------
