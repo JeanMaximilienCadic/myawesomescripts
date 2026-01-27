@@ -77,11 +77,43 @@ Followed by these sections:
    - If it does, ensure the Changelog section references it.
    - If it does not, inform the user it will be created, and generate an initial `CHANGELOG.md` with an `## [Unreleased]` section listing recent git commits grouped by type.
 
-4. **Present changes:**
+4. **Test commands found in the README:**
+   - After generating or updating the README content, extract all shell/bash code blocks from the document.
+   - Classify each command as **safe** or **unsafe**:
+     - **Safe commands** (run these automatically):
+       - `--help` or `--version` invocations
+       - `--dry-run` variants of install/build commands
+       - Read-only commands: `task --list`, `python -c "import package"`, `uv pip install --dry-run .`
+       - Commands that only print output without side effects
+     - **Unsafe commands** (do NOT run these):
+       - Commands that write, install, delete, or modify files (`pip install`, `uv pip install .`, `docker build`, `rm`, `make install`, etc.)
+       - Commands that start services or long-running processes
+       - Commands that require interactive input
+       - Commands that need network access to external services (excluding package index checks)
+       - Commands that require elevated privileges (`sudo`)
+   - For each safe command, run it and verify it exits successfully (exit code 0).
+   - For unsafe commands, attempt a dry-run or validation equivalent when possible:
+     - `pip install .` → run `uv pip install --dry-run .` or `pip install --dry-run .`
+     - `docker build .` → verify `Dockerfile` exists and is valid syntax
+     - `task <target>` → verify the target exists with `task --list`
+     - Install commands → verify the package/dependency file referenced exists
+   - Collect results into a summary table:
+     ```
+     | Command | Source Section | Status | Notes |
+     | --- | --- | --- | --- |
+     | `uv pip install .` | Installing | PASS (dry-run) | Resolved 2 packages |
+     | `python demo.py` | Running | SKIP (side effects) | - |
+     | `task --list` | Taskfile commands | PASS | 15 targets found |
+     ```
+   - If any command fails, flag the relevant README section as needing a fix and suggest a correction.
+   - Present the test results to the user alongside the section update summary.
+
+5. **Present changes:**
    - Show the user a summary of which sections were updated and why.
+   - Show the command test results table from step 4.
    - Ask the user to confirm before writing.
 
-5. **Write the updated README.md.**
+6. **Write the updated README.md.**
 
 ## Rules
 - Never delete user-written custom sections.
