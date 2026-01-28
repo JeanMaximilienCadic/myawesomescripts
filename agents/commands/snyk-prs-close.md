@@ -26,6 +26,14 @@ Find and close all open Snyk-related pull requests in the current repository.
    ```
    Use `--delete-branch` to also remove the remote branch. If deleting the branch fails (e.g. branch already deleted or from a fork), that is acceptable — continue closing the remaining PRs.
 
-7. After processing all PRs, print a summary showing:
+7. After closing all PRs, delete any remaining remote branches that start with `snyk-`:
+   ```
+   git fetch --prune origin
+   git branch -r | grep -i snyk | sed 's|origin/||' | xargs -I {} git push origin --delete {}
+   ```
+   Some branches may already be deleted by `--delete-branch` in step 6 — ignore errors for those.
+
+8. After processing all PRs and branches, print a summary showing:
    - Total PRs closed
-   - Any PRs that failed to close (with error details)
+   - Total branches deleted
+   - Any PRs or branches that failed (with error details)

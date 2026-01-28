@@ -52,59 +52,80 @@ taskfiles/
    - Map Makefile dependencies to Taskfile `deps`.
    - Convert Makefile recipes to `cmds`.
 
-5. **Detect Python package and add wheel build task:**
+5. **Detect Python package and add build tasks:**
    - Check if the repository is a Python package by looking for `pyproject.toml`, `setup.py`, or `setup.cfg` at the root.
-   - If it is a Python package, add a `build:wheel` task (or `python:wheel` if grouped under python) that builds a wheel using `uv`:
-     ```yaml
-     wheel:
-       desc: Build wheel distribution with uv
-       preconditions:
-         - sh: command -v uv
-           msg: "uv is required but not installed. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
-         - sh: test -f pyproject.toml
-           msg: "pyproject.toml not found. Run /pygrade to migrate your setup.py first."
-       vars:
-         DIST_DIR: '{{.ROOT_DIR}}/dist'
-       cmds:
-         - mkdir -p {{.DIST_DIR}}
-         - uv build --wheel --out-dir {{.DIST_DIR}}
-     ```
-   - Also add a `build:sdist` task for source distribution:
-     ```yaml
-     sdist:
-       desc: Build source distribution with uv
-       preconditions:
-         - sh: command -v uv
-           msg: "uv is required but not installed."
-         - sh: test -f pyproject.toml
-           msg: "pyproject.toml not found."
-       vars:
-         DIST_DIR: '{{.ROOT_DIR}}/dist'
-       cmds:
-         - mkdir -p {{.DIST_DIR}}
-         - uv build --sdist --out-dir {{.DIST_DIR}}
-     ```
-   - Add a `build:all` task that builds both wheel and sdist:
-     ```yaml
-     all:
-       desc: Build wheel and source distribution
-       deps:
-         - wheel
-         - sdist
-     ```
-   - Add a `build:clean` task to remove the dist folder:
-     ```yaml
-     clean:
-       desc: Remove dist directory
-       cmds:
-         - rm -rf {{.DIST_DIR}}
-     ```
-   - These build tasks should go in a `taskfiles/build.yml` sub-taskfile, included as:
+   - If it is a Python package, ensure `__init__.py` contains a `__build__ = "dev"` variable (add it after `__version__` if missing).
+   - Add a `taskfiles/build.yml` sub-taskfile with the following tasks, included in the root Taskfile as:
      ```yaml
      build:
        taskfile: taskfiles/build.yml
        optional: true
      ```
+   - The build taskfile must define shared vars and the following tasks:
+     ```yaml
+     version: '3'
+
+     vars:
+       DIST_DIR: '{{.ROOT_DIR}}/dist'
+       INIT_FILE: '{{.ROOT_DIR}}/<package_name>/__init__.py'
+
+     tasks:
+       stamp:
+         desc: Stamp __build__ in __init__.py with the current UTC build date
+         internal: true
+         cmds:
+           - sed -i 's/^__build__ = .*/__build__ = "{{.BUILD_DATE}}"/' {{.INIT_FILE}}
+         vars:
+           BUILD_DATE:
+             sh: date -u +%Y-%m-%dT%H:%M:%SZ
+
+       unstamp:
+         desc: Reset __build__ in __init__.py back to dev
+         internal: true
+         cmds:
+           - sed -i 's/^__build__ = .*/__build__ = "dev"/' {{.INIT_FILE}}
+
+       wheel:
+         desc: Build wheel distribution with uv
+         preconditions:
+           - sh: command -v uv
+             msg: "uv is required but not installed. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+           - sh: test -f pyproject.toml
+             msg: "pyproject.toml not found. Run /pygrade to migrate your setup.py first."
+         cmds:
+           - task: stamp
+           - mkdir -p {{.DIST_DIR}}/legacy
+           - cmd: mv {{.DIST_DIR}}/*.whl {{.DIST_DIR}}/legacy/ 2>/dev/null || true
+           - uv build --wheel --out-dir {{.DIST_DIR}}
+           - task: unstamp
+
+       sdist:
+         desc: Build source distribution with uv
+         preconditions:
+           - sh: command -v uv
+             msg: "uv is required but not installed."
+           - sh: test -f pyproject.toml
+             msg: "pyproject.toml not found."
+         cmds:
+           - task: stamp
+           - mkdir -p {{.DIST_DIR}}
+           - uv build --sdist --out-dir {{.DIST_DIR}}
+           - task: unstamp
+
+       all:
+         desc: Build wheel and source distribution
+         deps:
+           - wheel
+           - sdist
+
+       clean:
+         desc: Remove dist directory
+         cmds:
+           - rm -rf {{.DIST_DIR}}
+     ```
+   - **Build stamping:** The `stamp` task writes the current UTC date (`YYYY-MM-DDTHH:MM:SSZ`) into `__build__` before building. The `unstamp` task resets it to `"dev"` after building, keeping the working tree clean.
+   - **Legacy wheel archiving:** The `wheel` task moves any existing `.whl` files in `dist/` to `dist/legacy/` before building, so `dist/` always contains only the latest wheel.
+   - Replace `<package_name>` with the actual Python package directory name.
    - The wheel file will be output to the `dist/` folder at the repository root.
 
 6. **Add common utility tasks:**
