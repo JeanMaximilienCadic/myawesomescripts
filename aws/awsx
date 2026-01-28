@@ -81,10 +81,18 @@ list_instances() {
         ] | unique | join(",") | "\($gid)=\(.)"
     ')
 
+    # Fetch SSM agent status for all instances
+    SSM_INFO=$(aws ssm describe-instance-information \
+        --query "InstanceInformationList[].{ID:InstanceId, Status:PingStatus}" \
+        --output json 2>/dev/null || echo "[]")
+
+    # Build a lookup: instance-id -> SSM ping status
+    SSM_STATUS_MAP=$(echo "$SSM_INFO" | jq -r '.[] | "\(.ID)=\(.Status)"')
+
     # Print header
-    printf "${GREEN}%-22s %-30s %-14s %-12s %-18s %-18s %s${NC}\n" \
-        "INSTANCE ID" "NAME" "TYPE" "STATE" "PRIVATE IP" "PUBLIC IP" "OPEN PORTS (INBOUND)"
-    printf '%.0s-' {1..160}; echo
+    printf "${GREEN}%-22s %-30s %-14s %-12s %-10s %-18s %-18s %s${NC}\n" \
+        "INSTANCE ID" "NAME" "TYPE" "STATE" "SSM" "PRIVATE IP" "PUBLIC IP" "OPEN PORTS (INBOUND)"
+    printf '%.0s-' {1..175}; echo
 
     # Iterate instances and print rows
     echo "$INSTANCES_JSON" | jq -c '.[]' | while IFS= read -r inst; do
@@ -108,15 +116,31 @@ list_instances() {
         PORTS=$(echo "$PORTS" | tr ',' '\n' | sort -t'-' -k1 -n -u | paste -sd',' -)
         PORTS=${PORTS:-"none"}
 
+        # Lookup SSM status for this instance
+        SSM_STATUS=$(echo "$SSM_STATUS_MAP" | grep "^${ID}=" | cut -d= -f2-)
+        SSM_STATUS=${SSM_STATUS:-"-"}
+
+        # Pad text first, then wrap with color (ANSI codes break printf width)
+        STATE_PADDED=$(printf "%-12s" "$STATE")
+        SSM_PADDED=$(printf "%-10s" "$SSM_STATUS")
+
         # Color the state
         case "$STATE" in
-            running) STATE_COL="${GREEN}${STATE}${NC}" ;;
-            stopped) STATE_COL="${RED}${STATE}${NC}" ;;
-            *)       STATE_COL="${YELLOW}${STATE}${NC}" ;;
+            running) STATE_COL="${GREEN}${STATE_PADDED}${NC}" ;;
+            stopped) STATE_COL="${RED}${STATE_PADDED}${NC}" ;;
+            *)       STATE_COL="${YELLOW}${STATE_PADDED}${NC}" ;;
         esac
 
-        printf "%-22s %-30s %-14s %-12b %-18s %-18s %s\n" \
-            "$ID" "$NAME" "$TYPE" "$STATE_COL" "$PRIV_IP" "$PUB_IP" "$PORTS"
+        # Color the SSM status
+        case "$SSM_STATUS" in
+            Online)         SSM_COL="${GREEN}${SSM_PADDED}${NC}" ;;
+            Offline)        SSM_COL="${RED}${SSM_PADDED}${NC}" ;;
+            ConnectionLost) SSM_COL="${RED}${SSM_PADDED}${NC}" ;;
+            *)              SSM_COL="${YELLOW}${SSM_PADDED}${NC}" ;;
+        esac
+
+        printf "%-22s %-30s %-14s %b %b %-18s %-18s %s\n" \
+            "$ID" "$NAME" "$TYPE" "$STATE_COL" "$SSM_COL" "$PRIV_IP" "$PUB_IP" "$PORTS"
     done
 }
 
