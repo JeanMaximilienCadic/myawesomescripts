@@ -40,10 +40,84 @@ show_status() {
     echo -e "-------------------------------------\n  Instance Name:  ${GREEN}${INSTANCE_NAME}${NC}\n  Instance ID:    ${ID}\n  Instance Type:  ${TYPE}\n  State:          ${STATE_COLOR}${STATE}${NC}\n  Private IP:     ${PRIVATE_IP}\n  Public IP:      ${PUBLIC_IP}\n-------------------------------------"
 }
 
-# --- Function to list all stopped instances ---
-list_stopped() {
-    echo -e "${YELLOW}Fetching list of stopped EC2 instances...${NC}"
-    aws ec2 describe-instances --filters "Name=instance-state-name,Values=stopped" --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value, Type:InstanceType}" --output table
+# --- Function to list all instances with status and open ports ---
+list_instances() {
+    echo -e "${YELLOW}Fetching all EC2 instances...${NC}"
+
+    # Get all instances as JSON
+    INSTANCES_JSON=$(aws ec2 describe-instances \
+        --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value, Type:InstanceType, State:State.Name, PrivateIP:PrivateIpAddress, PublicIP:PublicIpAddress, SGs:SecurityGroups[].GroupId}" \
+        --output json)
+
+    if [ -z "$INSTANCES_JSON" ] || [ "$INSTANCES_JSON" == "[]" ]; then
+        echo -e "${RED}No EC2 instances found.${NC}"
+        return
+    fi
+
+    # Collect all unique security group IDs
+    ALL_SG_IDS=$(echo "$INSTANCES_JSON" | jq -r '.[].SGs[]' | sort -u)
+
+    # Fetch all security group rules in one call
+    if [ -n "$ALL_SG_IDS" ]; then
+        SG_RULES_JSON=$(aws ec2 describe-security-groups \
+            --group-ids $ALL_SG_IDS \
+            --query "SecurityGroups[].{GroupId:GroupId, Rules:IpPermissions}" \
+            --output json 2>/dev/null || echo "[]")
+    else
+        SG_RULES_JSON="[]"
+    fi
+
+    # Build a lookup: sg-id -> ports summary
+    SG_PORTS_MAP=$(echo "$SG_RULES_JSON" | jq -r '
+        .[] | .GroupId as $gid |
+        [.Rules[] |
+            if .FromPort == .ToPort then
+                (.FromPort | tostring)
+            elif .FromPort != null then
+                "\(.FromPort)-\(.ToPort)"
+            else
+                "all"
+            end
+        ] | unique | join(",") | "\($gid)=\(.)"
+    ')
+
+    # Print header
+    printf "${GREEN}%-22s %-30s %-14s %-12s %-18s %-18s %s${NC}\n" \
+        "INSTANCE ID" "NAME" "TYPE" "STATE" "PRIVATE IP" "PUBLIC IP" "OPEN PORTS (INBOUND)"
+    printf '%.0s-' {1..160}; echo
+
+    # Iterate instances and print rows
+    echo "$INSTANCES_JSON" | jq -c '.[]' | while IFS= read -r inst; do
+        ID=$(echo "$inst" | jq -r '.ID')
+        NAME=$(echo "$inst" | jq -r '.Name // "N/A"')
+        TYPE=$(echo "$inst" | jq -r '.Type')
+        STATE=$(echo "$inst" | jq -r '.State')
+        PRIV_IP=$(echo "$inst" | jq -r '.PrivateIP // "N/A"')
+        PUB_IP=$(echo "$inst" | jq -r '.PublicIP // "N/A"')
+
+        # Gather ports from all attached security groups
+        SG_IDS=$(echo "$inst" | jq -r '.SGs[]')
+        PORTS=""
+        for sgid in $SG_IDS; do
+            SG_PORTS=$(echo "$SG_PORTS_MAP" | grep "^${sgid}=" | cut -d= -f2-)
+            if [ -n "$SG_PORTS" ]; then
+                PORTS="${PORTS:+$PORTS,}$SG_PORTS"
+            fi
+        done
+        # Deduplicate and sort ports
+        PORTS=$(echo "$PORTS" | tr ',' '\n' | sort -t'-' -k1 -n -u | paste -sd',' -)
+        PORTS=${PORTS:-"none"}
+
+        # Color the state
+        case "$STATE" in
+            running) STATE_COL="${GREEN}${STATE}${NC}" ;;
+            stopped) STATE_COL="${RED}${STATE}${NC}" ;;
+            *)       STATE_COL="${YELLOW}${STATE}${NC}" ;;
+        esac
+
+        printf "%-22s %-30s %-14s %-12b %-18s %-18s %s\n" \
+            "$ID" "$NAME" "$TYPE" "$STATE_COL" "$PRIV_IP" "$PUB_IP" "$PORTS"
+    done
 }
 
 # --- Function to update the ~/.ssh/config file ---
@@ -149,7 +223,7 @@ switch_type() {
 usage() {
     # UPDATED: New usage instructions
     echo "Usage: $0 {list|start|stop|force-stop|switch <gpu|cpu>|update-ssh|status}"
-    echo "  list          - Lists all stopped EC2 instances."
+    echo "  list          - Lists all EC2 instances with status and open ports."
     echo "  start         - Starts the '${INSTANCE_NAME}' instance and updates ~/.ssh/config."
     echo "  stop          - Stops the instance gracefully."
     echo "  force-stop    - Force stops the instance (risk of data corruption)."
@@ -166,7 +240,7 @@ if [ -z "$1" ]; then usage; fi
 
 # UPDATED: Handle the new 'force-stop' command
 case "$1" in
-    list) list_stopped ;;
+    list) list_instances ;;
     start) start_instance ;;
     stop) stop_instance ;;
     force-stop) force_stop_instance ;;
