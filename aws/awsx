@@ -5,19 +5,35 @@
 # Usage: ./manage-ec2.sh {list|start|stop|force-stop|switch <gpu|cpu>|update-ssh|status}
 
 # --- Configuration ---
-# The 'Name' tag of the EC2 instance you want to manage.
-if [ -z "INSTANCE_NAME" ]; then
-    echo "❌ Error: INSTANCE_NAME environment variable is not set"
-    echo "   Please set INSTANCE_NAME"
+# Check required AWS environment variables
+if [ -z "$AWS_DEFAULT_REGION" ] && [ -z "$AWS_REGION" ]; then
+    echo "❌ Error: AWS region not configured"
+    echo "   Please set AWS_DEFAULT_REGION or AWS_REGION environment variable"
+    echo "   Example: export AWS_DEFAULT_REGION=ap-northeast-1"
     exit 1
 fi
 
+if [ -z "$AWS_PROFILE" ] && [ -z "$AWS_ACCESS_KEY_ID" ]; then
+    echo "❌ Error: AWS credentials not configured"
+    echo "   Please set AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY"
+    echo "   Example: export AWS_PROFILE=your-profile-name"
+    exit 1
+fi
+
+# The 'Name' tag of the EC2 instance you want to manage (required for most commands except 'list')
+INSTANCE_NAME="${INSTANCE_NAME:-}"
 
 SSH_CONFIG_FILE="$HOME/.ssh/config"
 
 # --- Instance Type Configuration ---
 GPU_INSTANCE_TYPE="g4dn.4xlarge"
 CPU_INSTANCE_TYPE="m6i.2xlarge" # 8 vCPUs, 32 GiB RAM
+
+# --- SSM Tunnel Configuration ---
+# These can be overridden via environment variables
+INTERNAL_PORT="${INTERNAL_PORT:-18080}"  # Internal port for SSM (localhost only)
+LOCAL_PORT="${LOCAL_PORT:-8080}"          # External port exposed via socat
+REMOTE_PORT="${REMOTE_PORT:-80}"          # Remote service port
 
 # --- Colors for output ---
 GREEN='\033[0;32m'
@@ -89,10 +105,41 @@ list_instances() {
     # Build a lookup: instance-id -> SSM ping status
     SSM_STATUS_MAP=$(echo "$SSM_INFO" | jq -r '.[] | "\(.ID)=\(.Status)"')
 
+    # Detect active SSM tunnels by parsing session-manager-plugin processes
+    # Format: instance-id=local_port|remote_host|status
+    TUNNEL_MAP=$(ps aux 2>/dev/null | grep -o 'session-manager-plugin.*' | while read -r line; do
+        # Extract instance ID from the JSON payload
+        INST_ID=$(echo "$line" | grep -oP '"Target"\s*:\s*"\K[^"]+' 2>/dev/null || true)
+        # Extract local port from parameters
+        LOCAL_P=$(echo "$line" | grep -oP '"localPortNumber"\s*:\s*\["\K[^"]+' 2>/dev/null || true)
+        # Extract remote host
+        REMOTE_H=$(echo "$line" | grep -oP '"host"\s*:\s*\["\K[^"]+' 2>/dev/null || true)
+        # Extract remote port
+        REMOTE_P=$(echo "$line" | grep -oP '"portNumber"\s*:\s*\["\K[^"]+' 2>/dev/null || true)
+
+        if [ -n "$INST_ID" ] && [ -n "$LOCAL_P" ]; then
+            # Test if tunnel is responsive (quick check)
+            if nc -z -w1 localhost "$LOCAL_P" 2>/dev/null; then
+                # Check if socat relay exists for this port
+                SOCAT_PORT=$(ps aux 2>/dev/null | grep -oP "socat.*TCP-LISTEN:\K[0-9]+" | head -1)
+                if [ -n "$SOCAT_PORT" ]; then
+                    STATUS="ok:${SOCAT_PORT}"
+                else
+                    STATUS="ok"
+                fi
+            else
+                STATUS="down"
+            fi
+            # Shorten remote host for display
+            SHORT_HOST=$(echo "$REMOTE_H" | sed 's/\.internal\.yoii\.jp//' | sed 's/\.ml$//' | cut -c1-15)
+            echo "${INST_ID}=${LOCAL_P}|${SHORT_HOST}:${REMOTE_P}|${STATUS}"
+        fi
+    done)
+
     # Print header
-    printf "${GREEN}%-22s %-30s %-14s %-12s %-10s %-18s %-18s %s${NC}\n" \
-        "INSTANCE ID" "NAME" "TYPE" "STATE" "SSM" "PRIVATE IP" "PUBLIC IP" "OPEN PORTS (INBOUND)"
-    printf '%.0s-' {1..175}; echo
+    printf "${GREEN}%-22s %-30s %-14s %-12s %-10s %-25s %-18s %-18s %s${NC}\n" \
+        "INSTANCE ID" "NAME" "TYPE" "STATE" "SSM" "TUNNEL" "PRIVATE IP" "PUBLIC IP" "OPEN PORTS (INBOUND)"
+    printf '%.0s-' {1..200}; echo
 
     # Iterate instances and print rows
     echo "$INSTANCES_JSON" | jq -c '.[]' | while IFS= read -r inst; do
@@ -120,9 +167,36 @@ list_instances() {
         SSM_STATUS=$(echo "$SSM_STATUS_MAP" | grep "^${ID}=" | cut -d= -f2-)
         SSM_STATUS=${SSM_STATUS:-"-"}
 
+        # Lookup tunnel status for this instance
+        # Format: local_port|remote_host:port|status
+        TUNNEL_INFO=$(echo "$TUNNEL_MAP" | grep "^${ID}=" | cut -d= -f2-)
+        if [ -n "$TUNNEL_INFO" ]; then
+            T_LOCAL=$(echo "$TUNNEL_INFO" | cut -d'|' -f1)
+            T_REMOTE=$(echo "$TUNNEL_INFO" | cut -d'|' -f2)
+            T_STATUS=$(echo "$TUNNEL_INFO" | cut -d'|' -f3)
+            if [[ "$T_STATUS" == ok* ]]; then
+                # Extract socat port if present (ok:8080)
+                SOCAT_P=$(echo "$T_STATUS" | cut -d':' -f2)
+                if [ -n "$SOCAT_P" ] && [ "$SOCAT_P" != "ok" ]; then
+                    TUNNEL_STATUS="${T_REMOTE}→:${SOCAT_P}"
+                    TUNNEL_OK=1
+                else
+                    TUNNEL_STATUS="${T_REMOTE}→:${T_LOCAL}"
+                    TUNNEL_OK=1
+                fi
+            else
+                TUNNEL_STATUS="${T_REMOTE}[DOWN]"
+                TUNNEL_OK=0
+            fi
+        else
+            TUNNEL_STATUS="-"
+            TUNNEL_OK=-1
+        fi
+
         # Pad text first, then wrap with color (ANSI codes break printf width)
         STATE_PADDED=$(printf "%-12s" "$STATE")
         SSM_PADDED=$(printf "%-10s" "$SSM_STATUS")
+        TUNNEL_PADDED=$(printf "%-25s" "$TUNNEL_STATUS")
 
         # Color the state
         case "$STATE" in
@@ -139,8 +213,17 @@ list_instances() {
             *)              SSM_COL="${YELLOW}${SSM_PADDED}${NC}" ;;
         esac
 
-        printf "%-22s %-30s %-14s %b %b %-18s %-18s %s\n" \
-            "$ID" "$NAME" "$TYPE" "$STATE_COL" "$SSM_COL" "$PRIV_IP" "$PUB_IP" "$PORTS"
+        # Color the tunnel status
+        if [ "$TUNNEL_OK" = "1" ]; then
+            TUNNEL_COL="${GREEN}${TUNNEL_PADDED}${NC}"
+        elif [ "$TUNNEL_OK" = "0" ]; then
+            TUNNEL_COL="${RED}${TUNNEL_PADDED}${NC}"
+        else
+            TUNNEL_COL="${YELLOW}${TUNNEL_PADDED}${NC}"
+        fi
+
+        printf "%-22s %-30s %-14s %b %b %b %-18s %-18s %s\n" \
+            "$ID" "$NAME" "$TYPE" "$STATE_COL" "$SSM_COL" "$TUNNEL_COL" "$PRIV_IP" "$PUB_IP" "$PORTS"
     done
 }
 
@@ -243,17 +326,148 @@ switch_type() {
     echo -e "${GREEN}Success! Instance type for '${INSTANCE_NAME}' is now '${NEW_TYPE}'.${NC}"; echo "You can start it with './manage-ec2.sh start'."
 }
 
+# --- Function to start SSM tunnel with socat relay ---
+tunnel_start() {
+    # Check required variables for tunnel
+    if [ -z "$BASTION_INSTANCE_ID" ]; then
+        echo -e "${RED}❌ Error: BASTION_INSTANCE_ID environment variable is not set${NC}"
+        echo "   Please set BASTION_INSTANCE_ID to the bastion EC2 instance ID"
+        echo "   Example: export BASTION_INSTANCE_ID=i-0123456789abcdef0"
+        exit 1
+    fi
+    if [ -z "$REMOTE_HOST" ]; then
+        echo -e "${RED}❌ Error: REMOTE_HOST environment variable is not set${NC}"
+        echo "   Please set REMOTE_HOST to the target host accessible from the bastion"
+        echo "   Example: export REMOTE_HOST=myservice.internal.example.com"
+        exit 1
+    fi
+
+    # Check if tunnel is already up
+    if nc -z localhost "${LOCAL_PORT}" 2>/dev/null; then
+        echo -e "${GREEN}✓ Tunnel already active at localhost:${LOCAL_PORT}${NC}"
+        exit 0
+    fi
+
+    echo -e "${YELLOW}Tunnel not found. Establishing connection...${NC}"
+
+    # Check AWS auth
+    if ! aws sts get-caller-identity >/dev/null 2>&1; then
+        echo -e "${RED}AWS session expired or missing. Please login first.${NC}"
+        exit 1
+    fi
+
+    # Start SSM session on internal port (binds to localhost only)
+    echo "Starting SSM tunnel to ${REMOTE_HOST}:${REMOTE_PORT} via ${BASTION_INSTANCE_ID}..."
+    nohup aws ssm start-session \
+        --target "${BASTION_INSTANCE_ID}" \
+        --document-name AWS-StartPortForwardingSessionToRemoteHost \
+        --parameters "{\"host\":[\"${REMOTE_HOST}\"],\"portNumber\":[\"${REMOTE_PORT}\"],\"localPortNumber\":[\"${INTERNAL_PORT}\"]}" \
+        > /tmp/ssm-session.log 2>&1 < /dev/null &
+
+    # Wait for SSM tunnel
+    echo -e "${YELLOW}Waiting for SSM tunnel on localhost:${INTERNAL_PORT}...${NC}"
+    for i in $(seq 1 10); do
+        if nc -z localhost "${INTERNAL_PORT}" 2>/dev/null; then
+            echo -e "${GREEN}✓ SSM tunnel established on localhost:${INTERNAL_PORT}${NC}"
+            break
+        fi
+        sleep 1
+    done
+
+    if ! nc -z localhost "${INTERNAL_PORT}" 2>/dev/null; then
+        echo -e "${RED}✗ Failed to establish SSM tunnel. Check /tmp/ssm-session.log${NC}"
+        cat /tmp/ssm-session.log
+        exit 1
+    fi
+
+    # Start socat relay to expose on all interfaces
+    echo -e "${YELLOW}Starting socat relay on 0.0.0.0:${LOCAL_PORT} -> localhost:${INTERNAL_PORT}...${NC}"
+    nohup socat TCP-LISTEN:${LOCAL_PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${INTERNAL_PORT} \
+        > /tmp/socat-relay.log 2>&1 < /dev/null &
+
+    # Wait for socat
+    sleep 1
+    if nc -z localhost "${LOCAL_PORT}" 2>/dev/null; then
+        echo -e "${GREEN}✓ Tunnel accessible at 0.0.0.0:${LOCAL_PORT}${NC}"
+    else
+        echo -e "${RED}✗ Failed to start socat relay. Check /tmp/socat-relay.log${NC}"
+        cat /tmp/socat-relay.log
+        exit 1
+    fi
+}
+
+# --- Function to stop SSM tunnel and socat relay ---
+tunnel_stop() {
+    echo -e "${YELLOW}Stopping SSM tunnel...${NC}"
+
+    # Kill socat relay
+    if pkill -f "socat.*TCP-LISTEN:${LOCAL_PORT}" 2>/dev/null; then
+        echo -e "${GREEN}✓ Stopped socat relay${NC}"
+    else
+        echo "  No socat relay found"
+    fi
+
+    # Kill SSM session
+    if pkill -f "session-manager-plugin" 2>/dev/null; then
+        echo -e "${GREEN}✓ Stopped SSM session${NC}"
+    else
+        echo "  No SSM session found"
+    fi
+
+    echo "Done."
+}
+
+# --- Function to test tunnel connection ---
+tunnel_test() {
+    if [ -z "$HEALTH_URL" ]; then
+        # Default to checking if port is open
+        if nc -z localhost "${LOCAL_PORT}" 2>/dev/null; then
+            echo -e "${GREEN}✓ Tunnel port ${LOCAL_PORT} is open${NC}"
+        else
+            echo -e "${RED}✗ Tunnel port ${LOCAL_PORT} is not accessible${NC}"
+            echo "  Make sure the tunnel is running: $0 tunnel"
+            exit 1
+        fi
+    else
+        # Test health endpoint
+        if curl -f -s --max-time 2 "$HEALTH_URL" | grep -qi "ok\|healthy\|success"; then
+            echo -e "${GREEN}✓ Health check passed at ${HEALTH_URL}${NC}"
+        else
+            echo -e "${RED}✗ Failed to connect to ${HEALTH_URL}${NC}"
+            echo "  Make sure the tunnel is running: $0 tunnel"
+            exit 1
+        fi
+    fi
+}
+
 # --- Main script logic: Parse command-line arguments ---
 usage() {
-    # UPDATED: New usage instructions
-    echo "Usage: $0 {list|start|stop|force-stop|switch <gpu|cpu>|update-ssh|status}"
-    echo "  list          - Lists all EC2 instances with status and open ports."
-    echo "  start         - Starts the '${INSTANCE_NAME}' instance and updates ~/.ssh/config."
-    echo "  stop          - Stops the instance gracefully."
-    echo "  force-stop    - Force stops the instance (risk of data corruption)."
-    echo "  switch <type> - Changes instance type. Type must be 'gpu' or 'cpu'."
-    echo "  update-ssh    - Updates ~/.ssh/config for the running instance."
-    echo "  status        - Displays deployment information for the instance."
+    echo "Usage: $0 <command> [options]"
+    echo ""
+    echo "EC2 Instance Commands:"
+    echo "  list          - Lists all EC2 instances with status and open ports"
+    echo "  start         - Starts the instance (requires INSTANCE_NAME)"
+    echo "  stop          - Stops the instance gracefully (requires INSTANCE_NAME)"
+    echo "  force-stop    - Force stops the instance (requires INSTANCE_NAME)"
+    echo "  switch <type> - Changes instance type to 'gpu' or 'cpu' (requires INSTANCE_NAME)"
+    echo "  update-ssh    - Updates ~/.ssh/config for the running instance (requires INSTANCE_NAME)"
+    echo "  status        - Displays deployment information (requires INSTANCE_NAME)"
+    echo ""
+    echo "SSM Tunnel Commands:"
+    echo "  tunnel        - Start SSM port forwarding tunnel with socat relay"
+    echo "  tunnel-stop   - Stop the SSM tunnel and socat relay"
+    echo "  tunnel-test   - Test if the tunnel is working"
+    echo ""
+    echo "Required Environment Variables:"
+    echo "  AWS_DEFAULT_REGION or AWS_REGION  - AWS region"
+    echo "  AWS_PROFILE or AWS_ACCESS_KEY_ID  - AWS credentials"
+    echo ""
+    echo "Tunnel Environment Variables:"
+    echo "  BASTION_INSTANCE_ID  - EC2 instance ID of the bastion host"
+    echo "  REMOTE_HOST          - Target host accessible from bastion"
+    echo "  REMOTE_PORT          - Target port (default: 80)"
+    echo "  LOCAL_PORT           - Local port to expose (default: 8080)"
+    echo "  HEALTH_URL           - Optional URL for tunnel-test health check"
     exit 1
 }
 
@@ -262,7 +476,6 @@ if ! command -v jq &> /dev/null; then
     echo "Please install it (e.g., 'sudo apt-get install jq' or 'brew install jq') and try again."; exit 1; fi
 if [ -z "$1" ]; then usage; fi
 
-# UPDATED: Handle the new 'force-stop' command
 case "$1" in
     list) list_instances ;;
     start) start_instance ;;
@@ -271,5 +484,8 @@ case "$1" in
     switch) if [ -z "$2" ]; then echo -e "${RED}Error: The 'switch' command requires a second argument: 'gpu' or 'cpu'.${NC}"; usage; fi; switch_type "$2" ;;
     update-ssh) run_ssh_update ;;
     status) show_status ;;
+    tunnel) tunnel_start ;;
+    tunnel-stop) tunnel_stop ;;
+    tunnel-test) tunnel_test ;;
     *) usage ;;
 esac
