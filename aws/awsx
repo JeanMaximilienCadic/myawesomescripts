@@ -1,17 +1,28 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # A script to manage EC2 instances: list, start, stop, force-stop, switch types, update SSH config, and show status.
 #
 # Usage: ./manage-ec2.sh {list|start|stop|force-stop|switch <gpu|cpu>|update-ssh|status}
 
-# --- Configuration ---
-# Check required AWS environment variables
-if [ -z "$AWS_DEFAULT_REGION" ] && [ -z "$AWS_REGION" ]; then
-    echo "❌ Error: AWS region not configured"
-    echo "   Please set AWS_DEFAULT_REGION or AWS_REGION environment variable"
-    echo "   Example: export AWS_DEFAULT_REGION=ap-northeast-1"
-    exit 1
+# --- Handle login before env checks (login doesn't need credentials) ---
+if [ "$1" = "login" ]; then
+    profile="${2:-$AWS_PROFILE}"
+    if [ -z "$profile" ]; then
+        echo "Usage: $0 login [profile]"
+        echo ""
+        echo "  Runs 'aws sso login' for the given profile (or \$AWS_PROFILE)."
+        exit 1
+    fi
+    echo "Logging in with profile: ${profile}"
+    aws sso login --profile "$profile"
+    echo ""
+    echo "Verifying identity..."
+    aws sts get-caller-identity --profile "$profile" 2>&1
+    exit $?
 fi
+
+# --- Configuration ---
+# Check required AWS environment variables, with auto-detection fallback
 
 if [ -z "$AWS_PROFILE" ] && [ -z "$AWS_ACCESS_KEY_ID" ]; then
     echo "❌ Error: AWS credentials not configured"
@@ -19,6 +30,31 @@ if [ -z "$AWS_PROFILE" ] && [ -z "$AWS_ACCESS_KEY_ID" ]; then
     echo "   Example: export AWS_PROFILE=your-profile-name"
     exit 1
 fi
+
+if [ -z "$AWS_DEFAULT_REGION" ] && [ -z "$AWS_REGION" ]; then
+    # Try to read region from AWS config for the active profile
+    _detected_region=""
+    if command -v aws &>/dev/null; then
+        _detected_region=$(aws configure get region 2>/dev/null)
+    fi
+    if [ -n "$_detected_region" ]; then
+        export AWS_DEFAULT_REGION="$_detected_region"
+    else
+        echo "❌ Error: AWS region not configured"
+        echo "   Please set AWS_DEFAULT_REGION or AWS_REGION environment variable"
+        echo "   Example: export AWS_DEFAULT_REGION=ap-northeast-1"
+        exit 1
+    fi
+fi
+
+# --- AWS CLI wrapper: ensures --profile is passed for SSO credentials ---
+_aws() {
+    if [ -n "$AWS_PROFILE" ]; then
+        aws --profile "$AWS_PROFILE" "$@"
+    else
+        aws "$@"
+    fi
+}
 
 # The 'Name' tag of the EC2 instance you want to manage (required for most commands except 'list')
 INSTANCE_NAME="${INSTANCE_NAME:-}"
@@ -29,12 +65,6 @@ SSH_CONFIG_FILE="$HOME/.ssh/config"
 GPU_INSTANCE_TYPE="g4dn.4xlarge"
 CPU_INSTANCE_TYPE="m6i.2xlarge" # 8 vCPUs, 32 GiB RAM
 
-# --- SSM Tunnel Configuration ---
-# These can be overridden via environment variables
-INTERNAL_PORT="${INTERNAL_PORT:-18080}"  # Internal port for SSM (localhost only)
-LOCAL_PORT="${LOCAL_PORT:-8080}"          # External port exposed via socat
-REMOTE_PORT="${REMOTE_PORT:-80}"          # Remote service port
-
 # --- Colors for output ---
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
@@ -44,10 +74,727 @@ NC='\033[0m' # No Color
 # Exit immediately if a command exits with a non-zero status.
 set -e
 
+# =============================================================================
+# TUI (gum-based interactive mode) — invoked when no arguments are given
+# =============================================================================
+
+TUNNEL_DEBUG_LOG="/tmp/awsx-tunnel-debug.log"
+
+# --- Theme ---
+
+C_PRIMARY="39"     # Cyan — borders, headers
+C_ACCENT="220"     # Gold — highlights, active item
+C_DIM="245"        # Gray — separators, faint text
+C_TEXT="255"       # White — body text
+C_OK="78"          # Green — running/healthy
+C_DANGER="196"     # Red — destructive actions
+C_CURSOR="212"     # Pink — gum choose cursor
+BORDER_STYLE="rounded"
+PANEL_PADDING="1 3"
+PANEL_MIN_WIDTH=60
+
+# --- Unicode Logo ---
+
+AWSX_LOGO='█████╗  ██╗    ██╗███████╗██╗  ██╗
+██╔══██╗ ██║    ██║██╔════╝╚██╗██╔╝
+███████║ ██║ █╗ ██║███████╗ ╚███╔╝
+██╔══██║ ██║███╗██║╚════██║ ██╔██╗
+██║  ██║ ╚███╔███╔╝███████║██╔╝ ██╗
+╚═╝  ╚═╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═╝'
+
+# --- Helpers ---
+
+check_gum() {
+    if ! command -v gum &> /dev/null; then
+        echo "awsx interactive mode requires 'gum' (charmbracelet/gum)."
+        echo ""
+        case "$(uname -s)" in
+            Darwin) echo "  Install: brew install gum" ;;
+            Linux)  echo "  Install: sudo mkdir -p /etc/apt/keyrings && curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/charm.gpg && echo \"deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *\" | sudo tee /etc/apt/sources.list.d/charm.list && sudo apt update && sudo apt install gum" ;;
+            *)      echo "  See: https://github.com/charmbracelet/gum#installation" ;;
+        esac
+        exit 1
+    fi
+}
+
+tui_get_dims() {
+    TERM_COLS=$(tput cols 2>/dev/null || echo 80)
+    TERM_LINES=$(tput lines 2>/dev/null || echo 24)
+    PANEL_WIDTH=$(( TERM_COLS * 70 / 100 ))
+    [ "$PANEL_WIDTH" -lt "$PANEL_MIN_WIDTH" ] && PANEL_WIDTH=$PANEL_MIN_WIDTH
+    LEFT_MARGIN=$(( (TERM_COLS - PANEL_WIDTH) / 2 ))
+    [ "$LEFT_MARGIN" -lt 0 ] && LEFT_MARGIN=0
+}
+
+# Build the full header text (logo + separator + status) as a plain string.
+# Centered within TERM_COLS. Used as --header for gum choose / gum input.
+tui_build_header() {
+    tui_get_dims
+    local hdr=$'\n'
+    local _c="\033[1;38;5;${C_PRIMARY}m"   # bold cyan
+    local _d="\033[38;5;${C_DIM}m"          # dim gray
+    local _a="\033[1;38;5;${C_ACCENT}m"     # bold gold
+    local _r="\033[0m"                       # reset
+
+    # Logo — bold cyan, centered
+    while IFS= read -r line; do
+        local pad=$(( (TERM_COLS - ${#line}) / 2 ))
+        [ "$pad" -lt 0 ] && pad=0
+        hdr+="$(printf "${_c}%*s%s${_r}" "$pad" '' "$line")"$'\n'
+    done <<< "$AWSX_LOGO"
+
+    # Separator — dim gray
+    local sep
+    sep=$(printf '%*s' "$PANEL_WIDTH" '' | tr ' ' '─')
+    local sep_pad=$(( (TERM_COLS - PANEL_WIDTH) / 2 ))
+    hdr+="$(printf "${_d}%*s%s${_r}" "$sep_pad" '' "$sep")"$'\n'
+
+    # Status — dim gray
+    local profile="${AWS_PROFILE:-default}"
+    local region="${AWS_DEFAULT_REGION:-${AWS_REGION:-?}}"
+    local status="Profile: $profile   Region: $region"
+    local st_pad=$(( (TERM_COLS - ${#status}) / 2 ))
+    hdr+="$(printf "${_d}%*s%s${_r}" "$st_pad" '' "$status")"
+
+    printf '%s' "$hdr"
+}
+
+# Print the header directly to the terminal with ANSI colors.
+# Used before spinners, pagers, panels — anything that isn't gum choose/input.
+tui_show_header() {
+    clear
+    tui_get_dims
+
+    echo ""
+    echo "$AWSX_LOGO" | while IFS= read -r line; do
+        local pad=$(( (TERM_COLS - ${#line}) / 2 ))
+        [ "$pad" -lt 0 ] && pad=0
+        printf '\033[1;38;5;%sm%*s%s\033[0m\n' "$C_PRIMARY" "$pad" '' "$line"
+    done
+
+    local sep
+    sep=$(printf '%*s' "$PANEL_WIDTH" '' | tr ' ' '─')
+    local sep_pad=$(( (TERM_COLS - PANEL_WIDTH) / 2 ))
+    printf '\033[38;5;%sm%*s%s\033[0m\n' "$C_DIM" "$sep_pad" '' "$sep"
+
+    local profile="${AWS_PROFILE:-default}"
+    local region="${AWS_DEFAULT_REGION:-${AWS_REGION:-?}}"
+    local status="Profile: $profile   Region: $region"
+    local st_pad=$(( (TERM_COLS - ${#status}) / 2 ))
+    printf '\033[38;5;%sm%*s%s\033[0m\n\n' "$C_DIM" "$st_pad" '' "$status"
+}
+
+# Full-screen gum choose with logo header embedded.
+# Usage: tui_themed_choose "LABEL" item1 item2 ...
+# Optional: tui_themed_choose "LABEL" --extra "extra text" item1 item2 ...
+tui_themed_choose() {
+    local label="$1"; shift
+
+    # Optional --extra flag for embedding extra content (e.g. tunnel table)
+    local extra=""
+    if [ "${1:-}" = "--extra" ]; then
+        shift; extra="$1"; shift
+    fi
+
+    clear >/dev/tty 2>/dev/null
+    local full_hdr
+    full_hdr=$(tui_build_header)
+    [ -n "$extra" ] && full_hdr+=$'\n\n'"$extra"
+    # Label in bold gold (ANSI embedded so we don't need --header.foreground)
+    full_hdr+=$'\n\n'"$(printf '\033[1;38;5;%sm  %s\033[0m' "$C_ACCENT" "$label")"$'\n'
+
+    local selected
+    selected=$(printf '%s\n' "$@" | gum choose \
+        --header "$full_hdr" \
+        --cursor "  ▸ " \
+        --cursor.foreground "$C_CURSOR" \
+        --selected.foreground "$C_ACCENT") || return 1
+    [ -z "$selected" ] && return 1
+    echo "$selected"
+}
+
+# Full-screen gum input with logo header embedded.
+# Usage: tui_themed_input "Label" "placeholder" [default_value]
+tui_themed_input() {
+    local label="$1" placeholder="$2" default_val="${3:-}"
+
+    clear >/dev/tty 2>/dev/null
+    local full_hdr
+    full_hdr=$(tui_build_header)
+    full_hdr+=$'\n\n'"$(printf '\033[1;38;5;%sm  %s\033[0m' "$C_ACCENT" "$label")"$'\n'
+
+    local args=(
+        --header "$full_hdr"
+        --cursor.foreground "$C_CURSOR"
+        --prompt "  > "
+        --placeholder "$placeholder"
+    )
+    [ -n "$default_val" ] && args+=(--value "$default_val")
+    gum input "${args[@]}"
+}
+
+tui_themed_confirm() {
+    # Usage: tui_themed_confirm "prompt text" [--default-yes]
+    local prompt_text="$1"
+    local default_flag="--default=false"
+    [ "${2:-}" = "--default-yes" ] && default_flag=""
+    gum confirm $default_flag \
+        --prompt.foreground "$C_DANGER" \
+        "$prompt_text"
+}
+
+# Run a command, show spinner, then display output in a pager.
+# Usage: gum_run_show "Title" command [args...]
+gum_run_show() {
+    local title="$1"; shift
+    local tmpfile
+    tmpfile=$(mktemp /tmp/awsx-gum.XXXXXX)
+    ( "$@" ) > "$tmpfile" 2>&1 &
+    local cmd_pid=$!
+    gum spin --spinner dot \
+        --spinner.foreground "$C_PRIMARY" \
+        --title.foreground "$C_DIM" \
+        --title "$title" -- bash -c "while kill -0 $cmd_pid 2>/dev/null; do sleep 0.1; done"
+    wait $cmd_pid 2>/dev/null || true
+    if [ -s "$tmpfile" ]; then
+        gum pager --soft-wrap < "$tmpfile"
+    fi
+    rm -f "$tmpfile"
+}
+
+# Display a styled message box and wait for Enter.
+# Usage: gum_msg "message"
+gum_msg() {
+    local msg="$1"
+    gum style --border "$BORDER_STYLE" --padding "$PANEL_PADDING" \
+        --border-foreground "$C_PRIMARY" --foreground "$C_TEXT" "$msg"
+    read -r -p "Press Enter to continue..."
+}
+
+# Build CSV of active tunnels → TUNNEL_CSV
+build_tunnel_csv() {
+    local count="${#TUNNEL_PIDS[@]}"
+    TUNNEL_CSV="#,Local,Instance,Status"
+    local i=0
+    while [ "$i" -lt "$count" ]; do
+        local remote="${TUNNEL_INSTANCE_NAMES[$i]}:${TUNNEL_REMOTE_PORTS[$i]}"
+        TUNNEL_CSV+=$'\n'"$((i+1)),localhost:${TUNNEL_LOCAL_PORTS[$i]},$remote,${TUNNEL_STATUSES[$i]}"
+        i=$((i + 1))
+    done
+}
+
+# --- Instance picker ---
+
+fetch_instances_for_menu() {
+    local state_filter="${1:-all}"
+    local filters="Name=tag:Name,Values=*"
+    [ "$state_filter" = "running" ] && filters="$filters Name=instance-state-name,Values=running"
+    [ "$state_filter" = "stopped" ] && filters="$filters Name=instance-state-name,Values=stopped"
+    CACHED_INSTANCES_JSON=$(_aws ec2 describe-instances \
+        --filters $filters \
+        --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value, Type:InstanceType, State:State.Name}" \
+        --output json 2>/dev/null || echo "[]")
+}
+
+gum_instance_picker() {
+    local title="$1" state_filter="${2:-all}"
+    fetch_instances_for_menu "$state_filter"
+
+    local count
+    count=$(echo "$CACHED_INSTANCES_JSON" | jq 'length')
+    if [ "$count" -eq 0 ]; then
+        gum_msg "No instances found (filter: $state_filter)."
+        return 1
+    fi
+
+    local raw_names=()
+    local display_lines=()
+    local i=0
+    while [ "$i" -lt "$count" ]; do
+        local name state itype icon
+        name=$(echo "$CACHED_INSTANCES_JSON" | jq -r ".[$i].Name // \"N/A\"")
+        state=$(echo "$CACHED_INSTANCES_JSON" | jq -r ".[$i].State")
+        itype=$(echo "$CACHED_INSTANCES_JSON" | jq -r ".[$i].Type")
+        case "$state" in
+            running) icon="●" ;;
+            stopped) icon="◌" ;;
+            *)       icon="○" ;;
+        esac
+        raw_names+=("$name")
+        display_lines+=("$(printf "%s %-30s %-12s %s" "$icon" "$name" "[$state]" "$itype")")
+        i=$((i + 1))
+    done
+
+    local selected
+    selected=$(tui_themed_choose "$title" "${display_lines[@]}") || return 1
+    [ -z "$selected" ] && return 1
+
+    # Match selected line back to raw_names by index
+    local j=0
+    for line in "${display_lines[@]}"; do
+        if [ "$line" = "$selected" ]; then
+            TUI_PICKED_NAME="${raw_names[$j]}"
+            return 0
+        fi
+        j=$((j + 1))
+    done
+    return 1
+}
+
+# --- Main menu (two-level) ---
+
+gum_main_menu() {
+    # Level 1: section picker
+    local section
+    section=$(tui_themed_choose "MAIN MENU" \
+        "Instances" \
+        "Tunnels" \
+        "Tools" \
+        "───" \
+        "Exit") || return 1
+    [ -z "$section" ] && return 1
+    [ "$section" = "───" ] && return 2
+    [ "$section" = "Exit" ] && { echo "exit"; return 0; }
+
+    # Level 2: action within section
+    local action
+    case "$section" in
+        Instances)
+            action=$(tui_themed_choose "INSTANCES" \
+                "List all" \
+                "Start" \
+                "Stop" \
+                "Force stop" \
+                "Switch type (GPU / CPU)" \
+                "Status" \
+                "Update SSH config" \
+                "───" \
+                "Back") || return 2
+            [ "$action" = "───" ] && return 2
+            case "$action" in
+                "List all")                 echo "list" ;;
+                "Start")                    echo "start" ;;
+                "Stop")                     echo "stop" ;;
+                "Force stop")               echo "force-stop" ;;
+                "Switch type (GPU / CPU)")  echo "switch" ;;
+                "Status")                   echo "status" ;;
+                "Update SSH config")        echo "update-ssh" ;;
+                "Back")                     return 2 ;;
+                *)                          return 2 ;;
+            esac
+            ;;
+        Tunnels)
+            echo "tunnels"
+            ;;
+        Tools)
+            action=$(tui_themed_choose "TOOLS" \
+                "Resolve DNS to instance" \
+                "AWS SSO login" \
+                "───" \
+                "Back") || return 2
+            [ "$action" = "───" ] && return 2
+            case "$action" in
+                "Resolve DNS to instance")  echo "resolve" ;;
+                "AWS SSO login")            echo "login" ;;
+                "Back")                     return 2 ;;
+                *)                          return 2 ;;
+            esac
+            ;;
+    esac
+    return 0
+}
+
+# --- Instance action handlers ---
+
+tui_list() {
+    tui_show_header
+    gum_run_show " Fetching instances... " list_instances
+}
+
+tui_start() {
+    gum_instance_picker "SELECT INSTANCE TO START" "stopped" || return 0
+    INSTANCE_NAME="$TUI_PICKED_NAME"
+    tui_show_header
+    gum_run_show " Starting: $INSTANCE_NAME " start_instance
+}
+
+tui_stop() {
+    gum_instance_picker "SELECT INSTANCE TO STOP" "running" || return 0
+    INSTANCE_NAME="$TUI_PICKED_NAME"
+    tui_show_header
+    gum_run_show " Stopping: $INSTANCE_NAME " stop_instance
+}
+
+tui_force_stop() {
+    gum_instance_picker "FORCE-STOP INSTANCE" "running" || return 0
+    INSTANCE_NAME="$TUI_PICKED_NAME"
+
+    tui_themed_confirm "Force stopping '$INSTANCE_NAME' can cause data corruption. Proceed?" \
+        || return 0
+
+    gum_run_show " Force Stop: $INSTANCE_NAME " _do_force_stop "$INSTANCE_NAME"
+}
+
+_do_force_stop() {
+    local inst_name="$1"
+    local INSTANCE_ID
+    INSTANCE_ID=$(_aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=${inst_name}" "Name=instance-state-name,Values=running" \
+        --query "Reservations[0].Instances[0].InstanceId" --output text)
+    [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ] && { echo "Instance not running."; return 0; }
+    echo "Instance ID: ${INSTANCE_ID}"
+    _aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --force > /dev/null
+    echo "Force stop sent. Waiting..."
+    _aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+    echo "Instance is now stopped."
+}
+
+tui_switch() {
+    gum_instance_picker "SWITCH INSTANCE TYPE" "all" || return 0
+    INSTANCE_NAME="$TUI_PICKED_NAME"
+
+    local type_choice
+    type_choice=$(tui_themed_choose "TARGET TYPE FOR '$INSTANCE_NAME'" \
+        "GPU  ($GPU_INSTANCE_TYPE)" \
+        "CPU  ($CPU_INSTANCE_TYPE)") || return 0
+
+    # Extract gpu/cpu from choice
+    case "$type_choice" in
+        GPU*) type_choice="gpu" ;;
+        CPU*) type_choice="cpu" ;;
+    esac
+
+    gum_run_show " Switch: $INSTANCE_NAME -> $type_choice " switch_type "$type_choice"
+}
+
+tui_status() {
+    gum_instance_picker "INSTANCE STATUS" "all" || return 0
+    INSTANCE_NAME="$TUI_PICKED_NAME"
+    tui_show_header
+    gum_run_show " Status: $INSTANCE_NAME " show_status
+}
+
+tui_update_ssh() {
+    gum_instance_picker "UPDATE SSH CONFIG" "running" || return 0
+    INSTANCE_NAME="$TUI_PICKED_NAME"
+    tui_show_header
+    gum_run_show " SSH Update: $INSTANCE_NAME " run_ssh_update
+}
+
+tui_resolve() {
+    local input
+    input=$(tui_themed_input "Resolve DNS" "Enter URL or hostname") || return 0
+    [ -z "$input" ] && return 0
+    tui_show_header
+    gum_run_show " Resolve: $input " resolve_dns "$input"
+}
+
+tui_login() {
+    local profile
+    profile=$(tui_themed_input "AWS SSO Login" "AWS profile" "${AWS_PROFILE:-}") || return 0
+    [ -z "$profile" ] && return 0
+    tui_show_header
+    gum_run_show " Login: $profile " bash -c "
+        aws sso login --profile '$profile' 2>&1
+        echo ''
+        echo 'Verifying identity...'
+        aws sts get-caller-identity --profile '$profile' 2>&1
+    "
+}
+
+# =============================================================================
+# Tunnel TUI
+# =============================================================================
+
+detect_active_tunnels() {
+    TUNNEL_PIDS=()
+    TUNNEL_LOCAL_PORTS=()
+    TUNNEL_REMOTE_PORTS=()
+    TUNNEL_INSTANCE_IDS=()
+    TUNNEL_INSTANCE_NAMES=()
+    TUNNEL_STATUSES=()
+
+    echo "=== detect_active_tunnels @ $(date) ===" > "$TUNNEL_DEBUG_LOG"
+
+    local lines
+    lines=$(ps -ww -eo pid,args 2>/dev/null | grep '[s]ession-manager-plugin' || true)
+
+    echo "--- raw processes ---" >> "$TUNNEL_DEBUG_LOG"
+    if [ -z "$lines" ]; then
+        echo "(none)" >> "$TUNNEL_DEBUG_LOG"
+        echo "=== 0 tunnels ===" >> "$TUNNEL_DEBUG_LOG"
+        return 0
+    fi
+    echo "$lines" >> "$TUNNEL_DEBUG_LOG"
+    echo "" >> "$TUNNEL_DEBUG_LOG"
+
+    local all_names_json
+    all_names_json=$(_aws ec2 describe-instances \
+        --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value}" \
+        --output json 2>/dev/null || echo "[]")
+    echo "--- instances: $(echo "$all_names_json" | jq 'length') ---" >> "$TUNNEL_DEBUG_LOG"
+
+    while IFS= read -r proc_line; do
+        local pid args
+        pid=$(echo "$proc_line" | awk '{print $1}')
+        args=$(echo "$proc_line" | cut -d' ' -f2-)
+
+        echo "" >> "$TUNNEL_DEBUG_LOG"
+        echo "pid=$pid" >> "$TUNNEL_DEBUG_LOG"
+
+        local inst_id=""
+        inst_id=$(echo "$args" | sed -n 's/.*"Target"[[:space:]]*:[[:space:]]*"\(i-[^"]*\)".*/\1/p')
+        echo "  inst_id (json): '$inst_id'" >> "$TUNNEL_DEBUG_LOG"
+        if [ -z "$inst_id" ]; then
+            inst_id=$(echo "$args" | sed -n 's/.*--target[[:space:]]\{1,\}\(i-[a-f0-9]*\).*/\1/p')
+            echo "  inst_id (flag): '$inst_id'" >> "$TUNNEL_DEBUG_LOG"
+        fi
+        [ -z "$inst_id" ] && { echo "  SKIP: no id" >> "$TUNNEL_DEBUG_LOG"; continue; }
+
+        local local_p=""
+        local_p=$(echo "$args" | sed -n 's/.*"localPortNumber"[[:space:]]*:[[:space:]]*\["\([0-9]*\)"\].*/\1/p')
+        echo "  local_p: '$local_p'" >> "$TUNNEL_DEBUG_LOG"
+        [ -z "$local_p" ] && { echo "  SKIP: no local port" >> "$TUNNEL_DEBUG_LOG"; continue; }
+
+        local remote_p=""
+        remote_p=$(echo "$args" | sed -n 's/.*"portNumber"[[:space:]]*:[[:space:]]*\["\([0-9]*\)"\].*/\1/p')
+        echo "  remote_p: '$remote_p'" >> "$TUNNEL_DEBUG_LOG"
+        [ -z "$remote_p" ] && remote_p="?"
+
+        local name
+        name=$(echo "$all_names_json" | jq -r --arg id "$inst_id" '.[] | select(.ID == $id) | .Name // "unknown"')
+        [ -z "$name" ] && name="$inst_id"
+        echo "  name: '$name'" >> "$TUNNEL_DEBUG_LOG"
+
+        local status
+        if nc -z -w1 localhost "$local_p" 2>/dev/null; then status="OK"; else status="DOWN"; fi
+        echo "  nc localhost:$local_p -> $status" >> "$TUNNEL_DEBUG_LOG"
+
+        TUNNEL_PIDS+=("$pid")
+        TUNNEL_LOCAL_PORTS+=("$local_p")
+        TUNNEL_REMOTE_PORTS+=("$remote_p")
+        TUNNEL_INSTANCE_IDS+=("$inst_id")
+        TUNNEL_INSTANCE_NAMES+=("$name")
+        TUNNEL_STATUSES+=("$status")
+    done <<< "$lines"
+
+    echo "" >> "$TUNNEL_DEBUG_LOG"
+    echo "=== ${#TUNNEL_PIDS[@]} tunnel(s) ===" >> "$TUNNEL_DEBUG_LOG"
+}
+
+gum_tunnel_picker() {
+    local title="${1:-SELECT TUNNEL}"
+    local count="${#TUNNEL_PIDS[@]}"
+    local display_lines=()
+    local i=0
+    while [ "$i" -lt "$count" ]; do
+        local status_icon
+        case "${TUNNEL_STATUSES[$i]}" in
+            OK)   status_icon="●" ;;
+            DOWN) status_icon="◌" ;;
+            *)    status_icon="○" ;;
+        esac
+        display_lines+=("$(printf "%s :%-5s  →  %-25s [%s]" \
+            "$status_icon" \
+            "${TUNNEL_LOCAL_PORTS[$i]}" \
+            "${TUNNEL_INSTANCE_NAMES[$i]}:${TUNNEL_REMOTE_PORTS[$i]}" \
+            "${TUNNEL_STATUSES[$i]}")")
+        i=$((i + 1))
+    done
+
+    local selected
+    selected=$(tui_themed_choose "$title" "${display_lines[@]}") || return 1
+    [ -z "$selected" ] && return 1
+
+    # Match by index
+    local j=0
+    for line in "${display_lines[@]}"; do
+        if [ "$line" = "$selected" ]; then
+            TUI_PICKED_TUNNEL_IDX="$j"
+            return 0
+        fi
+        j=$((j + 1))
+    done
+    return 1
+}
+
+tui_tunnels() {
+    while true; do
+        detect_active_tunnels
+        local count="${#TUNNEL_PIDS[@]}"
+
+        # Build extra content: tunnel table or empty state
+        local extra_content=""
+        if [ "$count" -gt 0 ]; then
+            build_tunnel_csv
+            extra_content=$(echo "$TUNNEL_CSV" | gum table)
+        else
+            extra_content="  (no active tunnels)"
+        fi
+
+        # Build action list
+        local actions=()
+        actions+=("New tunnel (EC2 instance)")
+        actions+=("New tunnel (DNS / Fargate)")
+        actions+=("New tunnel (Remote host via bastion)")
+        [ "$count" -gt 0 ] && actions+=("Stop a tunnel ...")
+        [ "$count" -gt 0 ] && actions+=("Stop all ($count)")
+        actions+=("View detection log")
+        actions+=("───")
+        actions+=("Back")
+
+        local header="TUNNELS"
+        [ "$count" -gt 0 ] && header="TUNNELS ($count active)"
+
+        local choice
+        choice=$(tui_themed_choose "$header" --extra "$extra_content" "${actions[@]}") || return 0
+        [ -z "$choice" ] && return 0
+        [ "$choice" = "───" ] && continue
+
+        case "$choice" in
+            "New tunnel (EC2 instance)")
+                tui_tunnel_new
+                ;;
+            "New tunnel (DNS / Fargate)")
+                tui_tunnel_dns
+                ;;
+            "New tunnel (Remote host via bastion)")
+                tui_tunnel_remote
+                ;;
+            "Stop a tunnel ..."*)
+                gum_tunnel_picker "STOP TUNNEL" || continue
+                local idx="$TUI_PICKED_TUNNEL_IDX"
+                local d=""
+                d+="Instance:    ${TUNNEL_INSTANCE_NAMES[$idx]}"$'\n'
+                d+="Instance ID: ${TUNNEL_INSTANCE_IDS[$idx]}"$'\n'
+                d+="Mapping:     localhost:${TUNNEL_LOCAL_PORTS[$idx]}  →  :${TUNNEL_REMOTE_PORTS[$idx]}"$'\n'
+                d+="Status:      ${TUNNEL_STATUSES[$idx]}"
+
+                echo ""
+                gum style --border "$BORDER_STYLE" --padding "$PANEL_PADDING" \
+                    --border-foreground "$C_PRIMARY" --foreground "$C_TEXT" "$d"
+                tui_themed_confirm "Stop this tunnel?" || continue
+                kill "${TUNNEL_PIDS[$idx]}" 2>/dev/null || true
+                sleep 1
+                gum_msg "Stopped tunnel on localhost:${TUNNEL_LOCAL_PORTS[$idx]}"
+                ;;
+            "Stop all"*)
+                tui_themed_confirm "Stop all $count active tunnel(s)?" || continue
+                tunnel_stop > /dev/null 2>&1
+                gum_msg "All tunnels stopped."
+                ;;
+            "View detection log")
+                if [ -f "$TUNNEL_DEBUG_LOG" ]; then
+                    gum pager --soft-wrap < "$TUNNEL_DEBUG_LOG"
+                else
+                    gum_msg "No log file yet."
+                fi
+                ;;
+            "Back")
+                return 0
+                ;;
+        esac
+    done
+}
+
+tui_tunnel_new() {
+    gum_instance_picker "NEW TUNNEL — SELECT INSTANCE" "running" || return 0
+    local pattern="$TUI_PICKED_NAME"
+
+    local local_port
+    local_port=$(tui_themed_input "Local Port" "Port to listen on locally" "18000") || return 0
+    [ -z "$local_port" ] && return 0
+
+    local remote_port
+    remote_port=$(tui_themed_input "Remote Port" "Port on the instance" "8000") || return 0
+    [ -z "$remote_port" ] && remote_port="8000"
+
+    tui_show_header
+    gum_run_show " Tunnel: $pattern :$remote_port → localhost:$local_port " \
+        tunnel_start "$pattern" "$local_port" "$remote_port"
+}
+
+tui_tunnel_dns() {
+    local input
+    input=$(tui_themed_input "Tunnel from DNS" "Enter URL or hostname") || return 0
+    [ -z "$input" ] && return 0
+
+    local local_port
+    local_port=$(tui_themed_input "Local Port" "Port to listen on locally" "8501") || return 0
+    [ -z "$local_port" ] && return 0
+
+    local remote_port
+    remote_port=$(tui_themed_input "Remote Port" "Port on the container/instance" "8501") || return 0
+    [ -z "$remote_port" ] && remote_port="8501"
+
+    tui_show_header
+    gum_run_show " Tunnel DNS: $input :$remote_port → localhost:$local_port " \
+        tunnel_dns_start "$input" "$local_port" "$remote_port"
+}
+
+tui_tunnel_remote() {
+    gum_instance_picker "REMOTE TUNNEL — SELECT BASTION" "running" || return 0
+    local bastion_pattern="$TUI_PICKED_NAME"
+
+    local remote_host
+    remote_host=$(tui_themed_input "Remote Host" "Private IP or hostname of target") || return 0
+    [ -z "$remote_host" ] && return 0
+
+    local local_port
+    local_port=$(tui_themed_input "Local Port" "Port to listen on locally" "8501") || return 0
+    [ -z "$local_port" ] && return 0
+
+    local remote_port
+    remote_port=$(tui_themed_input "Remote Port" "Port on the remote host" "8501") || return 0
+    [ -z "$remote_port" ] && remote_port="8501"
+
+    tui_show_header
+    gum_run_show " Tunnel: $bastion_pattern → $remote_host:$remote_port → localhost:$local_port " \
+        tunnel_remote_start "$bastion_pattern" "$remote_host" "$local_port" "$remote_port"
+}
+
+# --- TUI main loop ---
+
+tui_main_loop() {
+    check_gum
+    trap 'rm -f "$TUNNEL_DEBUG_LOG" 2>/dev/null; clear; exit 0' INT TERM
+
+    while true; do
+        set +e
+        local action
+        action=$(gum_main_menu); local rc=$?
+        set -e
+        # 1 = ESC/cancel → exit; 2 = back to section
+        [ $rc -eq 1 ] && { clear; exit 0; }
+        [ $rc -eq 2 ] && continue
+        [ -z "$action" ] && continue
+
+        set +e
+        case "$action" in
+            list)        tui_list ;;
+            start)       tui_start ;;
+            stop)        tui_stop ;;
+            force-stop)  tui_force_stop ;;
+            switch)      tui_switch ;;
+            status)      tui_status ;;
+            update-ssh)  tui_update_ssh ;;
+            tunnels)     tui_tunnels ;;
+            resolve)     tui_resolve ;;
+            login)       tui_login ;;
+            exit)        clear; exit 0 ;;
+        esac
+        set -e
+    done
+}
+
+# =============================================================================
+# Existing functions (unchanged)
+# =============================================================================
+
 # --- Function to display the instance's current deployment info ---
 show_status() {
     echo -e "${YELLOW}Fetching deployment status for instance: ${INSTANCE_NAME}...${NC}"
-    INSTANCE_INFO=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" --query "Reservations[0].Instances[0].{ID:InstanceId, Type:InstanceType, State:State.Name, PublicIP:PublicIpAddress, PrivateIP:PrivateIpAddress}" --output json)
+    INSTANCE_INFO=$(_aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" --query "Reservations[0].Instances[0].{ID:InstanceId, Type:InstanceType, State:State.Name, PublicIP:PublicIpAddress, PrivateIP:PrivateIpAddress}" --output json)
     if [ -z "$INSTANCE_INFO" ] || [ "$INSTANCE_INFO" == "null" ]; then
         echo -e "${RED}Error: Instance '${INSTANCE_NAME}' not found.${NC}"; exit 1; fi
     ID=$(echo "$INSTANCE_INFO" | jq -r .ID); TYPE=$(echo "$INSTANCE_INFO" | jq -r .Type); STATE=$(echo "$INSTANCE_INFO" | jq -r .State)
@@ -61,7 +808,7 @@ list_instances() {
     echo -e "${YELLOW}Fetching all EC2 instances...${NC}"
 
     # Get all instances as JSON
-    INSTANCES_JSON=$(aws ec2 describe-instances \
+    INSTANCES_JSON=$(_aws ec2 describe-instances \
         --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value, Type:InstanceType, State:State.Name, PrivateIP:PrivateIpAddress, PublicIP:PublicIpAddress, SGs:SecurityGroups[].GroupId}" \
         --output json)
 
@@ -75,7 +822,7 @@ list_instances() {
 
     # Fetch all security group rules in one call
     if [ -n "$ALL_SG_IDS" ]; then
-        SG_RULES_JSON=$(aws ec2 describe-security-groups \
+        SG_RULES_JSON=$(_aws ec2 describe-security-groups \
             --group-ids $ALL_SG_IDS \
             --query "SecurityGroups[].{GroupId:GroupId, Rules:IpPermissions}" \
             --output json 2>/dev/null || echo "[]")
@@ -98,7 +845,7 @@ list_instances() {
     ')
 
     # Fetch SSM agent status for all instances
-    SSM_INFO=$(aws ssm describe-instance-information \
+    SSM_INFO=$(_aws ssm describe-instance-information \
         --query "InstanceInformationList[].{ID:InstanceId, Status:PingStatus}" \
         --output json 2>/dev/null || echo "[]")
 
@@ -107,31 +854,23 @@ list_instances() {
 
     # Detect active SSM tunnels by parsing session-manager-plugin processes
     # Format: instance-id=local_port|remote_host|status
-    TUNNEL_MAP=$(ps aux 2>/dev/null | grep -o 'session-manager-plugin.*' | while read -r line; do
-        # Extract instance ID from the JSON payload
-        INST_ID=$(echo "$line" | grep -oP '"Target"\s*:\s*"\K[^"]+' 2>/dev/null || true)
-        # Extract local port from parameters
-        LOCAL_P=$(echo "$line" | grep -oP '"localPortNumber"\s*:\s*\["\K[^"]+' 2>/dev/null || true)
-        # Extract remote host
-        REMOTE_H=$(echo "$line" | grep -oP '"host"\s*:\s*\["\K[^"]+' 2>/dev/null || true)
-        # Extract remote port
-        REMOTE_P=$(echo "$line" | grep -oP '"portNumber"\s*:\s*\["\K[^"]+' 2>/dev/null || true)
+    # Uses portable sed (no grep -oP) for macOS compatibility
+    TUNNEL_MAP=$(ps -ww -eo args 2>/dev/null | grep '[s]ession-manager-plugin' | while read -r line; do
+        # Extract fields with sed — handles JSON with optional spaces
+        INST_ID=$(echo "$line" | sed -n 's/.*"Target"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        LOCAL_P=$(echo "$line" | sed -n 's/.*"localPortNumber"[[:space:]]*:[[:space:]]*\["\([0-9]*\)"\].*/\1/p')
+        REMOTE_H=$(echo "$line" | sed -n 's/.*"host"[[:space:]]*:[[:space:]]*\["\([^"]*\)"\].*/\1/p')
+        REMOTE_P=$(echo "$line" | sed -n 's/.*"portNumber"[[:space:]]*:[[:space:]]*\["\([0-9]*\)"\].*/\1/p')
 
         if [ -n "$INST_ID" ] && [ -n "$LOCAL_P" ]; then
             # Test if tunnel is responsive (quick check)
             if nc -z -w1 localhost "$LOCAL_P" 2>/dev/null; then
-                # Check if socat relay exists for this port
-                SOCAT_PORT=$(ps aux 2>/dev/null | grep -oP "socat.*TCP-LISTEN:\K[0-9]+" | head -1)
-                if [ -n "$SOCAT_PORT" ]; then
-                    STATUS="ok:${SOCAT_PORT}"
-                else
-                    STATUS="ok"
-                fi
+                STATUS="ok"
             else
                 STATUS="down"
             fi
             # Shorten remote host for display
-            SHORT_HOST=$(echo "$REMOTE_H" | sed 's/\.internal\.yoii\.jp//' | sed 's/\.ml$//' | cut -c1-15)
+            SHORT_HOST=$(echo "$REMOTE_H" | sed 's/\.internal\.[^.]*\.[^.]*$//' | sed 's/\.ml$//' | cut -c1-15)
             echo "${INST_ID}=${LOCAL_P}|${SHORT_HOST}:${REMOTE_P}|${STATUS}"
         fi
     done)
@@ -231,7 +970,7 @@ list_instances() {
 update_ssh_config() {
     local instance_id=$1
     echo -e "${YELLOW}Updating SSH config file: ${SSH_CONFIG_FILE}...${NC}"
-    NEW_HOSTNAME=$(aws ec2 describe-instances --instance-ids "${instance_id}" --query "Reservations[0].Instances[0].PublicDnsName" --output text)
+    NEW_HOSTNAME=$(_aws ec2 describe-instances --instance-ids "${instance_id}" --query "Reservations[0].Instances[0].PublicDnsName" --output text)
     if [ -z "$NEW_HOSTNAME" ] || [ "$NEW_HOSTNAME" == "None" ]; then
         echo -e "${RED}Error: Could not retrieve a public DNS name for the instance.${NC}"; exit 1; fi
     echo "New public DNS: ${NEW_HOSTNAME}"
@@ -255,7 +994,7 @@ update_ssh_config() {
 # --- Entrypoint function to run the SSH update independently ---
 run_ssh_update() {
     echo -e "${YELLOW}Updating SSH config for running instance: ${INSTANCE_NAME}...${NC}"
-    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    INSTANCE_ID=$(_aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
     if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
         echo -e "${RED}Error: Instance '${INSTANCE_NAME}' is not running.${NC}\nThe instance must be running to update its hostname."; exit 1; fi
     update_ssh_config "${INSTANCE_ID}"
@@ -264,24 +1003,24 @@ run_ssh_update() {
 # --- Function to start the instance ---
 start_instance() {
     echo -e "${YELLOW}Attempting to start instance: ${INSTANCE_NAME}...${NC}"
-    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=stopped" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    INSTANCE_ID=$(_aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=stopped" --query "Reservations[0].Instances[0].InstanceId" --output text)
     if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
         echo -e "${RED}Error: Instance '${INSTANCE_NAME}' not found or is not currently stopped.${NC}"; exit 1; fi
-    echo "Found instance ID: ${INSTANCE_ID}"; aws ec2 start-instances --instance-ids "${INSTANCE_ID}" > /dev/null
+    echo "Found instance ID: ${INSTANCE_ID}"; _aws ec2 start-instances --instance-ids "${INSTANCE_ID}" > /dev/null
     echo -e "${GREEN}Start command sent. Waiting for instance to be in 'running' state...${NC}"
-    aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"; echo -e "${GREEN}Instance is now running.${NC}"
+    _aws ec2 wait instance-running --instance-ids "${INSTANCE_ID}"; echo -e "${GREEN}Instance is now running.${NC}"
     update_ssh_config "${INSTANCE_ID}"
 }
 
 # --- Function to stop the instance ---
 stop_instance() {
     echo -e "${YELLOW}Attempting to stop instance: ${INSTANCE_NAME}...${NC}"
-    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    INSTANCE_ID=$(_aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
     if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
         echo -e "${GREEN}Instance '${INSTANCE_NAME}' is already stopped.${NC}"; return 0; fi
-    echo "Found running instance ID: ${INSTANCE_ID}"; aws ec2 stop-instances --instance-ids "${INSTANCE_ID}" > /dev/null
+    echo "Found running instance ID: ${INSTANCE_ID}"; _aws ec2 stop-instances --instance-ids "${INSTANCE_ID}" > /dev/null
     echo -e "${GREEN}Stop command sent. Waiting for instance to be in 'stopped' state...${NC}"
-    aws ec2 wait instance-stopped --instance-ids "${INSTANCE_ID}"; echo -e "${GREEN}Instance is now stopped.${NC}"
+    _aws ec2 wait instance-stopped --instance-ids "${INSTANCE_ID}"; echo -e "${GREEN}Instance is now stopped.${NC}"
 }
 
 # --- NEW: Function to force stop the instance ---
@@ -296,13 +1035,13 @@ force_stop_instance() {
     fi
 
     echo -e "${YELLOW}Attempting to force stop instance: ${INSTANCE_NAME}...${NC}"
-    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    INSTANCE_ID=$(_aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].InstanceId" --output text)
     if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
         echo -e "${GREEN}Instance '${INSTANCE_NAME}' is not running.${NC}"; return 0; fi
     echo "Found running instance ID: ${INSTANCE_ID}"
-    aws ec2 stop-instances --instance-ids "${INSTANCE_ID}" --force > /dev/null
+    _aws ec2 stop-instances --instance-ids "${INSTANCE_ID}" --force > /dev/null
     echo -e "${GREEN}Force stop command sent. Waiting for instance to be in 'stopped' state...${NC}"
-    aws ec2 wait instance-stopped --instance-ids "${INSTANCE_ID}"
+    _aws ec2 wait instance-stopped --instance-ids "${INSTANCE_ID}"
     echo -e "${GREEN}Instance is now stopped.${NC}"
 }
 
@@ -312,132 +1051,949 @@ switch_type() {
     if [[ "$target_type_arg" == "gpu" ]]; then NEW_TYPE=$GPU_INSTANCE_TYPE; elif [[ "$target_type_arg" == "cpu" ]]; then NEW_TYPE=$CPU_INSTANCE_TYPE; else
         echo -e "${RED}Error: Invalid type '${target_type_arg}'. Use 'gpu' or 'cpu'.${NC}"; usage; fi
     echo -e "${YELLOW}Fetching current status for instance '${INSTANCE_NAME}'...${NC}"
-    INSTANCE_ID=$(aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" --query "Reservations[0].Instances[0].InstanceId" --output text)
+    INSTANCE_ID=$(_aws ec2 describe-instances --filters "Name=tag:Name,Values=${INSTANCE_NAME}" --query "Reservations[0].Instances[0].InstanceId" --output text)
     if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
         echo -e "${RED}Error: Instance '${INSTANCE_NAME}' not found.${NC}"; exit 1; fi
-    INSTANCE_INFO=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].{Type:InstanceType, State:State.Name}" --output json)
+    INSTANCE_INFO=$(_aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].{Type:InstanceType, State:State.Name}" --output json)
     CURRENT_TYPE=$(echo "$INSTANCE_INFO" | jq -r .Type); INSTANCE_STATE=$(echo "$INSTANCE_INFO" | jq -r .State)
     echo -e "Current instance type is: ${GREEN}${CURRENT_TYPE}${NC}"
     echo -e "Attempting to switch to type: ${YELLOW}${NEW_TYPE}${NC}"
     if [ "$CURRENT_TYPE" == "$NEW_TYPE" ]; then echo -e "${GREEN}Instance is already the target type. No action needed.${NC}"; exit 0; fi
     if [ "$INSTANCE_STATE" == "running" ]; then echo "Instance is running. It will be stopped automatically before changing type."; stop_instance
     elif [ "$INSTANCE_STATE" != "stopped" ]; then echo -e "${RED}Error: Instance is in state '${INSTANCE_STATE}'. Please wait for it to be stopped or running.${NC}"; exit 1; fi
-    echo "Instance is stopped. Modifying type to ${NEW_TYPE}..."; aws ec2 modify-instance-attribute --instance-id "${INSTANCE_ID}" --instance-type "{\"Value\": \"${NEW_TYPE}\"}"
+    echo "Instance is stopped. Modifying type to ${NEW_TYPE}..."; _aws ec2 modify-instance-attribute --instance-id "${INSTANCE_ID}" --instance-type "{\"Value\": \"${NEW_TYPE}\"}"
     echo -e "${GREEN}Success! Instance type for '${INSTANCE_NAME}' is now '${NEW_TYPE}'.${NC}"; echo "You can start it with './manage-ec2.sh start'."
 }
 
-# --- Function to start SSM tunnel with socat relay ---
-tunnel_start() {
-    # Check required variables for tunnel
-    if [ -z "$BASTION_INSTANCE_ID" ]; then
-        echo -e "${RED}❌ Error: BASTION_INSTANCE_ID environment variable is not set${NC}"
-        echo "   Please set BASTION_INSTANCE_ID to the bastion EC2 instance ID"
-        echo "   Example: export BASTION_INSTANCE_ID=i-0123456789abcdef0"
+# --- Resolve instance name pattern to instance ID ---
+# Searches running EC2 instances whose Name tag matches *<pattern>*
+resolve_instance() {
+    local pattern="$1"
+    local result
+    result=$(_aws ec2 describe-instances \
+        --filters "Name=tag:Name,Values=*${pattern}*" "Name=instance-state-name,Values=running" \
+        --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value}" \
+        --output json)
+
+    local count
+    count=$(echo "$result" | jq 'length')
+
+    if [ "$count" -eq 0 ]; then
+        echo -e "${RED}❌ No running instance matching '*${pattern}*'${NC}"
         exit 1
-    fi
-    if [ -z "$REMOTE_HOST" ]; then
-        echo -e "${RED}❌ Error: REMOTE_HOST environment variable is not set${NC}"
-        echo "   Please set REMOTE_HOST to the target host accessible from the bastion"
-        echo "   Example: export REMOTE_HOST=myservice.internal.example.com"
+    elif [ "$count" -gt 1 ]; then
+        echo -e "${RED}❌ Multiple instances match '*${pattern}*':${NC}"
+        echo "$result" | jq -r '.[] | "  \(.ID)  \(.Name)"'
+        echo "Please use a more specific pattern."
         exit 1
     fi
 
-    # Check if tunnel is already up
-    if nc -z localhost "${LOCAL_PORT}" 2>/dev/null; then
-        echo -e "${GREEN}✓ Tunnel already active at localhost:${LOCAL_PORT}${NC}"
+    TUNNEL_INSTANCE_ID=$(echo "$result" | jq -r '.[0].ID')
+    TUNNEL_INSTANCE_NAME=$(echo "$result" | jq -r '.[0].Name')
+}
+
+# --- Function to start SSM tunnel (backgrounded) ---
+# Usage: awsx tunnel <name-pattern> <local_port> [remote_port]
+# Matches running EC2 instances whose Name tag contains <name-pattern>
+tunnel_start() {
+    local pattern="$1"
+    local local_port="$2"
+    local remote_port="${3:-8000}"
+
+    if [ -z "$pattern" ] || [ -z "$local_port" ]; then
+        echo -e "${RED}Usage: $0 tunnel <name-pattern> <local_port> [remote_port]${NC}"
+        echo ""
+        echo "  name-pattern  Substring to match against EC2 instance Name tags"
+        echo "  local_port    Local port to listen on"
+        echo "  remote_port   Remote port on the instance (default: 8000)"
+        echo ""
+        echo "  Examples:"
+        echo "    $0 tunnel my-app 18000           # *my-app*:8000 → localhost:18000"
+        echo "    $0 tunnel web-server 28000      # *web-server*:8000 → localhost:28000"
+        echo "    $0 tunnel myservice 9000 3000   # *myservice*:3000 → localhost:9000"
+        exit 1
+    fi
+
+    # Check if port is already in use
+    if nc -z localhost "${local_port}" 2>/dev/null; then
+        echo -e "${GREEN}✓ Port ${local_port} already in use (tunnel may be active)${NC}"
         exit 0
     fi
 
-    echo -e "${YELLOW}Tunnel not found. Establishing connection...${NC}"
+    resolve_instance "$pattern"
 
-    # Check AWS auth
-    if ! aws sts get-caller-identity >/dev/null 2>&1; then
-        echo -e "${RED}AWS session expired or missing. Please login first.${NC}"
-        exit 1
-    fi
+    local log_file="/tmp/ssm-tunnel-${pattern}-${local_port}.log"
 
-    # Start SSM session on internal port (binds to localhost only)
-    echo "Starting SSM tunnel to ${REMOTE_HOST}:${REMOTE_PORT} via ${BASTION_INSTANCE_ID}..."
-    nohup aws ssm start-session \
-        --target "${BASTION_INSTANCE_ID}" \
-        --document-name AWS-StartPortForwardingSessionToRemoteHost \
-        --parameters "{\"host\":[\"${REMOTE_HOST}\"],\"portNumber\":[\"${REMOTE_PORT}\"],\"localPortNumber\":[\"${INTERNAL_PORT}\"]}" \
-        > /tmp/ssm-session.log 2>&1 < /dev/null &
+    echo -e "${YELLOW}Starting SSM tunnel: ${TUNNEL_INSTANCE_NAME} (${TUNNEL_INSTANCE_ID}) :${remote_port} → localhost:${local_port}${NC}"
 
-    # Wait for SSM tunnel
-    echo -e "${YELLOW}Waiting for SSM tunnel on localhost:${INTERNAL_PORT}...${NC}"
-    for i in $(seq 1 10); do
-        if nc -z localhost "${INTERNAL_PORT}" 2>/dev/null; then
-            echo -e "${GREEN}✓ SSM tunnel established on localhost:${INTERNAL_PORT}${NC}"
-            break
+    local _profile_flag=""
+    [ -n "$AWS_PROFILE" ] && _profile_flag="--profile $AWS_PROFILE"
+    nohup aws $_profile_flag ssm start-session \
+        --target "${TUNNEL_INSTANCE_ID}" \
+        --document-name AWS-StartPortForwardingSession \
+        --parameters "{\"portNumber\":[\"${remote_port}\"],\"localPortNumber\":[\"${local_port}\"]}" \
+        > "$log_file" 2>&1 &
+
+    # Wait for tunnel to come up
+    for i in $(seq 1 15); do
+        if nc -z localhost "${local_port}" 2>/dev/null; then
+            echo -e "${GREEN}✓ Tunnel active: localhost:${local_port} → ${TUNNEL_INSTANCE_NAME}:${remote_port}${NC}"
+            echo "  Log: ${log_file}"
+            return 0
         fi
         sleep 1
     done
 
-    if ! nc -z localhost "${INTERNAL_PORT}" 2>/dev/null; then
-        echo -e "${RED}✗ Failed to establish SSM tunnel. Check /tmp/ssm-session.log${NC}"
-        cat /tmp/ssm-session.log
-        exit 1
+    echo -e "${RED}✗ Failed to establish tunnel. Log:${NC}"
+    cat "$log_file"
+    exit 1
+}
+
+# --- Nginx reverse proxy helpers for tunnel-dns ---
+_nginx_conf_dir="/opt/homebrew/etc/nginx/servers"
+_nginx_conf_prefix="awsx-tunnel-"
+
+_tunnel_dns_proxy_setup() {
+    local hostname="$1"
+    local local_port="$2"
+
+    # Skip if nginx is not installed
+    if ! command -v nginx >/dev/null 2>&1; then
+        return 0
     fi
 
-    # Start socat relay to expose on all interfaces
-    echo -e "${YELLOW}Starting socat relay on 0.0.0.0:${LOCAL_PORT} -> localhost:${INTERNAL_PORT}...${NC}"
-    nohup socat TCP-LISTEN:${LOCAL_PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${INTERNAL_PORT} \
-        > /tmp/socat-relay.log 2>&1 < /dev/null &
+    local conf_file="${_nginx_conf_dir}/${_nginx_conf_prefix}${hostname}.conf"
 
-    # Wait for socat
-    sleep 1
-    if nc -z localhost "${LOCAL_PORT}" 2>/dev/null; then
-        echo -e "${GREEN}✓ Tunnel accessible at 0.0.0.0:${LOCAL_PORT}${NC}"
+    # Create nginx server block
+    mkdir -p "$_nginx_conf_dir"
+    cat > "$conf_file" <<NGINXEOF
+server {
+    listen 80;
+    server_name ${hostname};
+
+    location / {
+        proxy_pass http://127.0.0.1:${local_port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 86400;
+    }
+}
+NGINXEOF
+
+    # Add /etc/hosts entry if missing (requires sudo)
+    if ! grep -q "127.0.0.1.*${hostname}" /etc/hosts 2>/dev/null; then
+        echo "  Adding ${hostname} to /etc/hosts (requires sudo)..."
+        sudo sh -c "echo '127.0.0.1 ${hostname}' >> /etc/hosts" 2>/dev/null || {
+            echo -e "${YELLOW}  Could not update /etc/hosts — run manually:${NC}"
+            echo "    sudo sh -c 'echo \"127.0.0.1 ${hostname}\" >> /etc/hosts'"
+        }
+    fi
+
+    # Reload or start nginx
+    if pgrep -f "nginx: master" >/dev/null 2>&1; then
+        nginx -s reload 2>/dev/null
     else
-        echo -e "${RED}✗ Failed to start socat relay. Check /tmp/socat-relay.log${NC}"
-        cat /tmp/socat-relay.log
-        exit 1
+        nginx 2>/dev/null
+    fi
+
+    echo -e "  ${GREEN}Reverse proxy: http://${hostname}/ → localhost:${local_port}${NC}"
+}
+
+_tunnel_dns_proxy_teardown() {
+    # Remove all awsx-managed nginx configs
+    local found=0
+    for conf in "${_nginx_conf_dir}/${_nginx_conf_prefix}"*.conf; do
+        [ -f "$conf" ] || continue
+        local hostname
+        hostname=$(basename "$conf" | sed "s/^${_nginx_conf_prefix}//" | sed 's/\.conf$//')
+        rm -f "$conf"
+        # Remove /etc/hosts entry
+        if grep -q "127.0.0.1.*${hostname}" /etc/hosts 2>/dev/null; then
+            sudo sed -i '' "/127\.0\.0\.1.*${hostname}/d" /etc/hosts 2>/dev/null || true
+        fi
+        echo -e "  ${GREEN}Removed proxy: ${hostname}${NC}"
+        found=1
+    done
+    if [ "$found" = "1" ] && command -v nginx >/dev/null 2>&1 && pgrep -f "nginx: master" >/dev/null 2>&1; then
+        nginx -s reload 2>/dev/null || true
     fi
 }
 
-# --- Function to stop SSM tunnel and socat relay ---
+# --- Function to stop all SSM tunnels ---
 tunnel_stop() {
-    echo -e "${YELLOW}Stopping SSM tunnel...${NC}"
-
-    # Kill socat relay
-    if pkill -f "socat.*TCP-LISTEN:${LOCAL_PORT}" 2>/dev/null; then
-        echo -e "${GREEN}✓ Stopped socat relay${NC}"
-    else
-        echo "  No socat relay found"
-    fi
-
-    # Kill SSM session
+    echo -e "${YELLOW}Stopping all SSM tunnels...${NC}"
     if pkill -f "session-manager-plugin" 2>/dev/null; then
-        echo -e "${GREEN}✓ Stopped SSM session${NC}"
+        echo -e "${GREEN}✓ Stopped SSM sessions${NC}"
     else
-        echo "  No SSM session found"
+        echo "  No SSM sessions found"
     fi
-
+    _tunnel_dns_proxy_teardown
     echo "Done."
 }
 
 # --- Function to test tunnel connection ---
 tunnel_test() {
-    if [ -z "$HEALTH_URL" ]; then
-        # Default to checking if port is open
-        if nc -z localhost "${LOCAL_PORT}" 2>/dev/null; then
-            echo -e "${GREEN}✓ Tunnel port ${LOCAL_PORT} is open${NC}"
-        else
-            echo -e "${RED}✗ Tunnel port ${LOCAL_PORT} is not accessible${NC}"
-            echo "  Make sure the tunnel is running: $0 tunnel"
-            exit 1
-        fi
-    else
-        # Test health endpoint
-        if curl -f -s --max-time 2 "$HEALTH_URL" | grep -qi "ok\|healthy\|success"; then
-            echo -e "${GREEN}✓ Health check passed at ${HEALTH_URL}${NC}"
-        else
-            echo -e "${RED}✗ Failed to connect to ${HEALTH_URL}${NC}"
-            echo "  Make sure the tunnel is running: $0 tunnel"
-            exit 1
-        fi
+    local local_port="$1"
+    if [ -z "$local_port" ]; then
+        echo -e "${RED}Usage: $0 tunnel-test <local_port>${NC}"
+        exit 1
     fi
+    if nc -z localhost "${local_port}" 2>/dev/null; then
+        echo -e "${GREEN}✓ Tunnel port ${local_port} is open${NC}"
+    else
+        echo -e "${RED}✗ Tunnel port ${local_port} is not accessible${NC}"
+        exit 1
+    fi
+}
+
+# --- Function to resolve a URL/hostname to its EC2 instance(s) ---
+# Traces DNS → IP → EC2 direct match, or DNS → CNAME → ALB → target group → EC2
+resolve_dns() {
+    local input="$1"
+    if [ -z "$input" ]; then
+        echo -e "${RED}Usage: $0 resolve <url-or-hostname>${NC}"
+        echo ""
+        echo "  Examples:"
+        echo "    $0 resolve http://app.dev.example.com/"
+        echo "    $0 resolve api.example.com"
+        exit 1
+    fi
+
+    # Strip protocol, path, port → bare hostname
+    local hostname
+    hostname=$(echo "$input" | sed 's|^[a-zA-Z]*://||' | sed 's|/.*||' | sed 's|:.*||')
+
+    echo -e "${YELLOW}Resolving: ${hostname}${NC}"
+    echo ""
+
+    # --- Step 1: DNS resolution ---
+    if ! command -v dig &> /dev/null; then
+        echo -e "${RED}Error: 'dig' is required. Install with: brew install bind${NC}"
+        exit 1
+    fi
+
+    echo -e "${YELLOW}[1/4] DNS lookup${NC}"
+    local dig_full
+    dig_full=$(dig +noall +answer "$hostname" 2>/dev/null)
+
+    if [ -z "$dig_full" ]; then
+        echo -e "${RED}  Could not resolve ${hostname}${NC}"
+        exit 1
+    fi
+
+    echo "$dig_full" | while IFS= read -r line; do echo "  $line"; done
+    echo ""
+
+    # Collect IPs and CNAMEs
+    local dig_short
+    dig_short=$(dig +short "$hostname" 2>/dev/null)
+    local ips=()
+    local cnames=()
+    while IFS= read -r record; do
+        [ -z "$record" ] && continue
+        if echo "$record" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            ips+=("$record")
+        else
+            cnames+=("${record%.}")  # strip trailing dot
+        fi
+    done <<< "$dig_short"
+
+    # --- Step 2: Fetch all EC2 instances ---
+    echo -e "${YELLOW}[2/4] Fetching EC2 instances${NC}"
+    local all_instances
+    all_instances=$(_aws ec2 describe-instances \
+        --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value, Type:InstanceType, State:State.Name, PrivateIP:PrivateIpAddress, PublicIP:PublicIpAddress}" \
+        --output json 2>/dev/null || echo "[]")
+    local inst_count
+    inst_count=$(echo "$all_instances" | jq 'length')
+    echo "  $inst_count instances loaded"
+    echo ""
+
+    local found=0
+
+    # --- Step 3: Direct IP match ---
+    echo -e "${YELLOW}[3/4] Matching IPs against instances${NC}"
+    for ip in "${ips[@]}"; do
+        local matches
+        matches=$(echo "$all_instances" | jq -c --arg ip "$ip" '.[] | select(.PrivateIP == $ip or .PublicIP == $ip)')
+        if [ -n "$matches" ]; then
+            while IFS= read -r match; do
+                found=1
+                local name id state itype priv pub
+                name=$(echo "$match" | jq -r '.Name // "N/A"')
+                id=$(echo "$match" | jq -r '.ID')
+                state=$(echo "$match" | jq -r '.State')
+                itype=$(echo "$match" | jq -r '.Type')
+                priv=$(echo "$match" | jq -r '.PrivateIP // "N/A"')
+                pub=$(echo "$match" | jq -r '.PublicIP // "N/A"')
+                echo -e "  ${GREEN}MATCH${NC}  ${ip} → ${GREEN}${name}${NC}"
+                echo "         Instance ID:  $id"
+                echo "         Type:         $itype"
+                echo "         State:        $state"
+                echo "         Private IP:   $priv"
+                echo "         Public IP:    $pub"
+                echo ""
+            done <<< "$matches"
+        else
+            echo "  $ip — no EC2 match"
+        fi
+    done
+    echo ""
+
+    # --- Step 4: If no direct match, trace through ALB/ELB ---
+    if [ "$found" -eq 0 ]; then
+        echo -e "${YELLOW}[4/4] Checking load balancers${NC}"
+        local lb_checked=0
+
+        for cname in "${cnames[@]}"; do
+            if echo "$cname" | grep -qiE '(elb|alb).*amazonaws\.com'; then
+                lb_checked=1
+                echo "  CNAME → $cname"
+
+                # ALB / NLB (elbv2)
+                local lb_arn
+                lb_arn=$(_aws elbv2 describe-load-balancers \
+                    --query "LoadBalancers[?DNSName=='${cname}'].LoadBalancerArn" \
+                    --output text 2>/dev/null || true)
+
+                if [ -n "$lb_arn" ] && [ "$lb_arn" != "None" ] && [ "$lb_arn" != "" ]; then
+                    local lb_name
+                    lb_name=$(echo "$lb_arn" | sed 's|.*/||')
+                    echo -e "  Load Balancer: ${GREEN}${lb_name}${NC}"
+                    echo ""
+
+                    # Get target groups via listeners
+                    local tg_arns
+                    tg_arns=$(_aws elbv2 describe-listeners \
+                        --load-balancer-arn "$lb_arn" \
+                        --query "Listeners[].DefaultActions[].TargetGroupArn" \
+                        --output text 2>/dev/null || true)
+
+                    for tg_arn in $tg_arns; do
+                        [ -z "$tg_arn" ] || [ "$tg_arn" = "None" ] && continue
+                        local tg_name
+                        tg_name=$(echo "$tg_arn" | sed 's|.*targetgroup/||' | sed 's|/.*||')
+                        echo -e "  Target Group: ${YELLOW}${tg_name}${NC}"
+
+                        local targets
+                        targets=$(_aws elbv2 describe-target-health \
+                            --target-group-arn "$tg_arn" \
+                            --query "TargetHealthDescriptions[].{ID:Target.Id, Port:Target.Port, Health:TargetHealth.State}" \
+                            --output json 2>/dev/null || echo "[]")
+
+                        echo "$targets" | jq -c '.[]' | while IFS= read -r target; do
+                            local tid tport thealth tname tstate
+                            tid=$(echo "$target" | jq -r '.ID')
+                            tport=$(echo "$target" | jq -r '.Port')
+                            thealth=$(echo "$target" | jq -r '.Health')
+                            tname=$(echo "$all_instances" | jq -r --arg id "$tid" '.[] | select(.ID == $id) | .Name // "N/A"')
+                            tstate=$(echo "$all_instances" | jq -r --arg id "$tid" '.[] | select(.ID == $id) | .State // "?"')
+                            [ -z "$tname" ] && tname="N/A"
+
+                            local health_color="$RED"
+                            [ "$thealth" = "healthy" ] && health_color="$GREEN"
+
+                            echo -e "    ${GREEN}${tname}${NC}  ($tid)"
+                            echo -e "      Port: ${tport}  Health: ${health_color}${thealth}${NC}  State: ${tstate}"
+                        done
+                        found=1
+                        echo ""
+                    done
+                fi
+
+                # Classic ELB fallback
+                if [ "$found" -eq 0 ]; then
+                    local classic_instances
+                    classic_instances=$(_aws elb describe-load-balancers \
+                        --query "LoadBalancerDescriptions[?DNSName=='${cname}'].Instances[].InstanceId" \
+                        --output text 2>/dev/null || true)
+                    if [ -n "$classic_instances" ] && [ "$classic_instances" != "None" ]; then
+                        echo "  Classic ELB instances:"
+                        for cid in $classic_instances; do
+                            local cname_inst
+                            cname_inst=$(echo "$all_instances" | jq -r --arg id "$cid" '.[] | select(.ID == $id) | .Name // "N/A"')
+                            echo -e "    ${GREEN}${cname_inst}${NC}  ($cid)"
+                        done
+                        found=1
+                        echo ""
+                    fi
+                fi
+            fi
+        done
+
+        if [ "$lb_checked" -eq 0 ]; then
+            echo "  No ELB/ALB CNAME found in DNS chain"
+
+            # Check Route53 for alias records
+            echo ""
+            echo -e "${YELLOW}  Checking Route53 hosted zones...${NC}"
+            local zones
+            zones=$(_aws route53 list-hosted-zones --query "HostedZones[].{ID:Id, Name:Name}" --output json 2>/dev/null || echo "[]")
+            local domain="${hostname}."
+            echo "$zones" | jq -c '.[]' | while IFS= read -r zone; do
+                local zone_name zone_id
+                zone_name=$(echo "$zone" | jq -r '.Name')
+                zone_id=$(echo "$zone" | jq -r '.ID')
+                if echo "$domain" | grep -q "${zone_name}$"; then
+                    echo "  Zone: $zone_name"
+                    _aws route53 list-resource-record-sets \
+                        --hosted-zone-id "$zone_id" \
+                        --query "ResourceRecordSets[?Name=='${domain}']" \
+                        --output json 2>/dev/null | jq -r '.[] | "    Type: \(.Type)  Value: \(.ResourceRecords[]?.Value // .AliasTarget.DNSName // "alias")"'
+                fi
+            done
+        fi
+        echo ""
+    else
+        echo "  (skipping load balancer check — direct match found)"
+        echo ""
+    fi
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${RED}Could not match ${hostname} to any EC2 instance.${NC}"
+        echo "The domain may point to a CDN, external proxy, or a different AWS account."
+    fi
+}
+
+# --- Resolve a URL/hostname to an SSM-tunnelable target (EC2 or Fargate) ---
+# Sets: RTARGET_TYPE (ec2|ecs), RTARGET_ID (SSM target), RTARGET_LABEL (display name)
+# Traces: DNS → direct IP match on EC2, or DNS → Route53 alias / CNAME → ALB → target group → EC2 or ECS Fargate
+resolve_to_tunnel_target() {
+    local input="$1"
+    local hostname
+    hostname=$(echo "$input" | sed 's|^[a-zA-Z]*://||' | sed 's|/.*||' | sed 's|:.*||')
+
+    RTARGET_TYPE=""
+    RTARGET_ID=""
+    RTARGET_LABEL=""
+    RTARGET_PRIVATE_IP=""
+    RTARGET_CONTAINER_PORT=""
+    RTARGET_BASTION_ID=""
+    RTARGET_BASTION_NAME=""
+
+    echo -e "${YELLOW}Resolving: ${hostname}${NC}"
+
+    # --- DNS ---
+    local dig_short
+    dig_short=$(dig +short "$hostname" 2>/dev/null)
+    if [ -z "$dig_short" ]; then
+        echo -e "${RED}  Could not resolve ${hostname}${NC}"
+        return 1
+    fi
+
+    local ips=() cnames=()
+    while IFS= read -r record; do
+        [ -z "$record" ] && continue
+        if echo "$record" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+            ips+=("$record")
+        else
+            cnames+=("${record%.}")
+        fi
+    done <<< "$dig_short"
+    echo "  DNS → ${ips[*]} ${cnames[*]}"
+
+    # --- EC2 instances ---
+    local all_instances
+    all_instances=$(_aws ec2 describe-instances \
+        --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key=='Name']|[0].Value, PrivateIP:PrivateIpAddress, PublicIP:PublicIpAddress, State:State.Name}" \
+        --output json 2>/dev/null || echo "[]")
+
+    # --- Direct IP → EC2 match ---
+    for ip in "${ips[@]}"; do
+        local match
+        match=$(echo "$all_instances" | jq -c --arg ip "$ip" '.[] | select((.PrivateIP == $ip or .PublicIP == $ip) and .State == "running")' | head -1)
+        if [ -n "$match" ]; then
+            local name id
+            name=$(echo "$match" | jq -r '.Name // "unknown"')
+            id=$(echo "$match" | jq -r '.ID')
+            RTARGET_TYPE="ec2"
+            RTARGET_ID="$id"
+            RTARGET_LABEL="EC2 $name ($id)"
+            echo -e "  ${GREEN}EC2 match: ${name}${NC}"
+            return 0
+        fi
+    done
+
+    # --- Find ALB: CNAME chain first, then Route53 alias ---
+    local alb_arn="" alb_dns=""
+
+    for cname in "${cnames[@]}"; do
+        if echo "$cname" | grep -qiE '(elb|alb).*amazonaws\.com'; then
+            alb_dns="$cname"
+            alb_arn=$(_aws elbv2 describe-load-balancers \
+                --query "LoadBalancers[?DNSName=='${alb_dns}'].LoadBalancerArn" \
+                --output text 2>/dev/null || true)
+            [ -n "$alb_arn" ] && [ "$alb_arn" != "None" ] && break
+            alb_arn=""
+        fi
+    done
+
+    if [ -z "$alb_arn" ]; then
+        echo "  No CNAME → ALB. Checking Route53 aliases..."
+        local zones
+        zones=$(_aws route53 list-hosted-zones --query "HostedZones[].{ID:Id, Name:Name}" --output json 2>/dev/null || echo "[]")
+        local domain="${hostname}."
+
+        while IFS= read -r zone; do
+            [ -z "$zone" ] && continue
+            local zone_name zone_id
+            zone_name=$(echo "$zone" | jq -r '.Name')
+            zone_id=$(echo "$zone" | jq -r '.ID')
+            if echo "$domain" | grep -q "${zone_name}$"; then
+                local alias_target
+                alias_target=$(_aws route53 list-resource-record-sets \
+                    --hosted-zone-id "$zone_id" \
+                    --query "ResourceRecordSets[?Name=='${domain}'].AliasTarget.DNSName | [0]" \
+                    --output text 2>/dev/null || true)
+                alias_target="${alias_target%.}"
+                if [ -n "$alias_target" ] && [ "$alias_target" != "None" ]; then
+                    echo "  Route53 alias → $alias_target"
+                    if echo "$alias_target" | grep -qiE '(elb|alb).*amazonaws\.com'; then
+                        alb_dns="$alias_target"
+                        alb_arn=$(_aws elbv2 describe-load-balancers \
+                            --query "LoadBalancers[?DNSName=='${alb_dns}'].LoadBalancerArn" \
+                            --output text 2>/dev/null || true)
+                        [ "$alb_arn" = "None" ] && alb_arn=""
+                    fi
+                fi
+                break
+            fi
+        done <<< "$(echo "$zones" | jq -c '.[]')"
+    fi
+
+    if [ -z "$alb_arn" ]; then
+        echo -e "${RED}  No ALB found for ${hostname}${NC}"
+        return 1
+    fi
+
+    echo "  ALB → $alb_dns"
+
+    # --- Target groups (prefer port 80/443 listeners) ---
+    local tg_arns
+    tg_arns=$(_aws elbv2 describe-listeners \
+        --load-balancer-arn "$alb_arn" \
+        --query "Listeners[?Port==\`80\`||Port==\`443\`].DefaultActions[].TargetGroupArn" \
+        --output text 2>/dev/null || true)
+    if [ -z "$tg_arns" ] || [ "$tg_arns" = "None" ]; then
+        tg_arns=$(_aws elbv2 describe-listeners \
+            --load-balancer-arn "$alb_arn" \
+            --query "Listeners[].DefaultActions[].TargetGroupArn" \
+            --output text 2>/dev/null || true)
+    fi
+
+    for tg_arn in $tg_arns; do
+        [ -z "$tg_arn" ] || [ "$tg_arn" = "None" ] && continue
+
+        local tg_info
+        tg_info=$(_aws elbv2 describe-target-groups \
+            --target-group-arns "$tg_arn" \
+            --query "TargetGroups[0].{Type:TargetType, Name:TargetGroupName}" \
+            --output json 2>/dev/null)
+        local tg_type tg_name
+        tg_type=$(echo "$tg_info" | jq -r '.Type')
+        tg_name=$(echo "$tg_info" | jq -r '.Name')
+        echo "  Target Group: $tg_name (type: $tg_type)"
+
+        # --- EC2 targets (type: instance) ---
+        if [ "$tg_type" = "instance" ]; then
+            local target_id
+            target_id=$(_aws elbv2 describe-target-health \
+                --target-group-arn "$tg_arn" \
+                --query "TargetHealthDescriptions[?TargetHealth.State=='healthy'].Target.Id | [0]" \
+                --output text 2>/dev/null || true)
+            if [ -n "$target_id" ] && [ "$target_id" != "None" ]; then
+                local name
+                name=$(echo "$all_instances" | jq -r --arg id "$target_id" '.[] | select(.ID == $id) | .Name // "unknown"')
+                RTARGET_TYPE="ec2"
+                RTARGET_ID="$target_id"
+                RTARGET_LABEL="EC2 $name ($target_id)"
+                echo -e "  ${GREEN}EC2 target: ${name}${NC}"
+                return 0
+            fi
+        fi
+
+        # --- Fargate targets (type: ip) ---
+        if [ "$tg_type" = "ip" ]; then
+            local target_health_json
+            target_health_json=$(_aws elbv2 describe-target-health \
+                --target-group-arn "$tg_arn" \
+                --query "TargetHealthDescriptions[?TargetHealth.State=='healthy'].Target | [0]" \
+                --output json 2>/dev/null || echo "null")
+            local target_ip target_port
+            target_ip=$(echo "$target_health_json" | jq -r '.Id // empty')
+            target_port=$(echo "$target_health_json" | jq -r '.Port // empty')
+            [ -z "$target_ip" ] && continue
+
+            echo "  Fargate target: ${target_ip}:${target_port}"
+            echo "  Searching ECS clusters for matching task..."
+
+            local clusters
+            clusters=$(_aws ecs list-clusters --query "clusterArns[]" --output text 2>/dev/null || true)
+
+            for cluster_arn in $clusters; do
+                local cluster_name
+                cluster_name=$(echo "$cluster_arn" | sed 's|.*/||')
+
+                local task_arns_str
+                task_arns_str=$(_aws ecs list-tasks --cluster "$cluster_name" \
+                    --desired-status RUNNING \
+                    --query "taskArns[]" --output text 2>/dev/null || true)
+                [ -z "$task_arns_str" ] || [ "$task_arns_str" = "None" ] && continue
+
+                local tasks_json
+                tasks_json=$(_aws ecs describe-tasks --cluster "$cluster_name" \
+                    --tasks $task_arns_str \
+                    --output json 2>/dev/null || echo '{"tasks":[]}')
+
+                # Match task by private IP in ENI attachment
+                local matching_task
+                matching_task=$(echo "$tasks_json" | jq -c --arg ip "$target_ip" '
+                    .tasks[] | select(
+                        .attachments[]?.details[]? |
+                        select(.name == "privateIPv4Address" and .value == $ip)
+                    ) | {
+                        taskArn: .taskArn,
+                        runtimeId: .containers[0].runtimeId,
+                        containerName: .containers[0].name,
+                        group: .group,
+                        execAgentRunning: ([.containers[0].managedAgents[]? | select(.name == "ExecuteCommandAgent" and .lastStatus == "RUNNING")] | length > 0)
+                    }' | head -1)
+
+                if [ -n "$matching_task" ]; then
+                    local task_arn task_id runtime_id container_name group exec_agent_running
+                    task_arn=$(echo "$matching_task" | jq -r '.taskArn')
+                    task_id=$(echo "$task_arn" | sed 's|.*/||')
+                    runtime_id=$(echo "$matching_task" | jq -r '.runtimeId')
+                    container_name=$(echo "$matching_task" | jq -r '.containerName')
+                    group=$(echo "$matching_task" | jq -r '.group // ""' | sed 's/^service://')
+                    exec_agent_running=$(echo "$matching_task" | jq -r '.execAgentRunning')
+
+                    if [ -z "$runtime_id" ] || [ "$runtime_id" = "null" ] || [ "$exec_agent_running" != "true" ]; then
+                        echo "  ECS Exec not enabled — looking for hop instance..."
+
+                        # Get ALB's VPC
+                        local alb_vpc
+                        alb_vpc=$(_aws elbv2 describe-load-balancers \
+                            --load-balancer-arns "$alb_arn" \
+                            --query "LoadBalancers[0].VpcId" --output text 2>/dev/null || true)
+
+                        if [ -z "$alb_vpc" ] || [ "$alb_vpc" = "None" ]; then
+                            echo -e "${RED}  Could not determine ALB VPC${NC}"
+                            return 1
+                        fi
+
+                        # --- Phase 1: SG-aware hop discovery ---
+                        local hop_id="" hop_name="" hop_sg=""
+                        local effective_port="${target_port:-8501}"
+
+                        # Get Fargate task's SG(s) from its ENI
+                        local fargate_sgs
+                        fargate_sgs=$(_aws ec2 describe-network-interfaces \
+                            --filters "Name=private-ip-address,Values=${target_ip}" \
+                            --query "NetworkInterfaces[0].Groups[].GroupId" \
+                            --output text 2>/dev/null || true)
+
+                        if [ -n "$fargate_sgs" ] && [ "$fargate_sgs" != "None" ]; then
+                            echo "  Fargate SGs: ${fargate_sgs}"
+
+                            # Collect source SGs allowed inbound on the target port
+                            local source_sgs=""
+                            for fg_sg in $fargate_sgs; do
+                                local rules_json
+                                rules_json=$(_aws ec2 describe-security-group-rules \
+                                    --filters "Name=group-id,Values=${fg_sg}" \
+                                    --query "SecurityGroupRules[?IsEgress==\`false\`]" \
+                                    --output json 2>/dev/null || echo '[]')
+
+                                # Filter rules that allow our target port (or all traffic -1)
+                                local matched_sgs
+                                matched_sgs=$(echo "$rules_json" | jq -r --arg port "$effective_port" --arg self "$fg_sg" '
+                                    .[] |
+                                    select(.ReferencedGroupInfo.GroupId != null) |
+                                    select(.ReferencedGroupInfo.GroupId != $self) |
+                                    select(
+                                        .IpProtocol == "-1" or
+                                        ((.FromPort // 0) <= ($port | tonumber) and (.ToPort // 0) >= ($port | tonumber))
+                                    ) |
+                                    .ReferencedGroupInfo.GroupId
+                                ' 2>/dev/null || true)
+
+                                for s in $matched_sgs; do
+                                    case " $source_sgs " in
+                                        *" $s "*) ;;  # dedupe
+                                        *) source_sgs="$source_sgs $s" ;;
+                                    esac
+                                done
+                            done
+
+                            source_sgs=$(echo "$source_sgs" | xargs)  # trim
+
+                            if [ -n "$source_sgs" ]; then
+                                echo "  Source SGs allowed on port ${effective_port}: ${source_sgs}"
+
+                                # Find running EC2 instances in those source SGs
+                                local sg_filter_values
+                                sg_filter_values=$(echo "$source_sgs" | tr ' ' ',')
+
+                                local candidate_instances
+                                candidate_instances=$(_aws ec2 describe-instances \
+                                    --filters "Name=instance.group-id,Values=${sg_filter_values}" \
+                                              "Name=instance-state-name,Values=running" \
+                                              "Name=vpc-id,Values=${alb_vpc}" \
+                                    --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key==\`Name\`]|[0].Value, SGs:SecurityGroups[].GroupId}" \
+                                    --output json 2>/dev/null || echo '[]')
+
+                                local candidate_count
+                                candidate_count=$(echo "$candidate_instances" | jq 'length')
+
+                                if [ "$candidate_count" -gt 0 ]; then
+                                    # Get SSM-managed instance IDs
+                                    local ssm_instances
+                                    ssm_instances=$(_aws ssm describe-instance-information \
+                                        --query "InstanceInformationList[?PingStatus=='Online'].InstanceId" \
+                                        --output json 2>/dev/null || echo '[]')
+
+                                    # Find first candidate with SSM online
+                                    local idx=0
+                                    while [ "$idx" -lt "$candidate_count" ]; do
+                                        local cand_id cand_name
+                                        cand_id=$(echo "$candidate_instances" | jq -r ".[$idx].ID")
+                                        cand_name=$(echo "$candidate_instances" | jq -r ".[$idx].Name // \"unknown\"")
+
+                                        local is_ssm
+                                        is_ssm=$(echo "$ssm_instances" | jq -r --arg id "$cand_id" 'if (. | index($id)) then "yes" else "no" end')
+
+                                        if [ "$is_ssm" = "yes" ]; then
+                                            # Find which source SG matched
+                                            local cand_sgs_json
+                                            cand_sgs_json=$(echo "$candidate_instances" | jq -r ".[$idx].SGs[]")
+                                            for cs in $cand_sgs_json; do
+                                                case " $source_sgs " in
+                                                    *" $cs "*) hop_sg="$cs"; break ;;
+                                                esac
+                                            done
+                                            hop_id="$cand_id"
+                                            hop_name="$cand_name"
+                                            break
+                                        fi
+                                        idx=$((idx + 1))
+                                    done
+                                fi
+                            fi
+                        fi
+
+                        # --- Phase 2: Bastion fallback ---
+                        if [ -z "$hop_id" ]; then
+                            echo -e "  ${YELLOW}No SG-aware hop found — falling back to bastion...${NC}"
+
+                            local bastion_json
+                            bastion_json=$(_aws ec2 describe-instances \
+                                --filters "Name=tag:Name,Values=*bastion*" \
+                                          "Name=instance-state-name,Values=running" \
+                                          "Name=vpc-id,Values=$alb_vpc" \
+                                --query "Reservations[].Instances[].{ID:InstanceId, Name:Tags[?Key==\`Name\`]|[0].Value}" \
+                                --output json 2>/dev/null | jq -c '.[0] // empty')
+
+                            if [ -z "$bastion_json" ]; then
+                                echo -e "${RED}  No running bastion found in VPC ${alb_vpc}${NC}"
+                                return 1
+                            fi
+
+                            hop_id=$(echo "$bastion_json" | jq -r '.ID')
+                            hop_name=$(echo "$bastion_json" | jq -r '.Name')
+                            echo -e "  ${YELLOW}Warning: bastion SG may not allow port ${effective_port} to Fargate${NC}"
+                        fi
+
+                        # --- Set output variables ---
+                        RTARGET_TYPE="ecs-via-bastion"
+                        RTARGET_PRIVATE_IP="$target_ip"
+                        RTARGET_CONTAINER_PORT="$effective_port"
+                        RTARGET_BASTION_ID="$hop_id"
+                        RTARGET_BASTION_NAME="$hop_name"
+                        RTARGET_ID="$hop_id"
+                        RTARGET_LABEL="ECS ${cluster_name} / ${group} / ${container_name} (via ${hop_name})"
+                        echo -e "  ${GREEN}Fargate: ${cluster_name} / ${group} / ${container_name}${NC}"
+                        echo "  Task IP: ${target_ip}:${target_port}"
+                        if [ -n "$hop_sg" ]; then
+                            echo -e "  ${GREEN}SG-aware hop: ${hop_name} (${hop_id}) — allowed via ${hop_sg}${NC}"
+                        else
+                            echo -e "  ${GREEN}Bastion: ${hop_name} (${hop_id})${NC}"
+                        fi
+                        return 0
+                    fi
+
+                    RTARGET_TYPE="ecs"
+                    RTARGET_ID="ecs:${cluster_name}_${task_id}_${runtime_id}"
+                    RTARGET_LABEL="ECS ${cluster_name} / ${group} / ${container_name}"
+                    echo -e "  ${GREEN}Fargate: ${cluster_name} / ${group} / ${container_name}${NC}"
+                    echo "  Task: ${task_id}"
+                    return 0
+                fi
+            done
+
+            echo -e "${RED}  No ECS task found with IP ${target_ip}${NC}"
+            return 1
+        fi
+    done
+
+    echo -e "${RED}  No tunnelable target found for ${hostname}${NC}"
+    return 1
+}
+
+# --- Start tunnel from DNS resolution (EC2 or Fargate) ---
+tunnel_dns_start() {
+    local input="$1"
+    local local_port="$2"
+    local remote_port="${3:-8501}"
+
+    if [ -z "$input" ] || [ -z "$local_port" ]; then
+        echo -e "${RED}Usage: $0 tunnel-dns <url-or-hostname> <local_port> [remote_port]${NC}"
+        echo ""
+        echo "  Resolves DNS → ALB → EC2 or Fargate, then starts an SSM tunnel."
+        echo "  Works with both EC2 instances and ECS Fargate tasks."
+        echo ""
+        echo "  Examples:"
+        echo "    $0 tunnel-dns http://app.dev.example.com/ 8501"
+        echo "    $0 tunnel-dns api.example.com 3000 8080"
+        exit 1
+    fi
+
+    # Extract hostname for reverse proxy
+    local tunnel_hostname
+    tunnel_hostname=$(echo "$input" | sed 's|^[a-zA-Z]*://||' | sed 's|/.*||' | sed 's|:.*||')
+
+    if nc -z localhost "${local_port}" 2>/dev/null; then
+        echo -e "${GREEN}✓ Port ${local_port} already in use (tunnel may be active)${NC}"
+        _tunnel_dns_proxy_setup "$tunnel_hostname" "$local_port"
+        exit 0
+    fi
+
+    resolve_to_tunnel_target "$input" || exit 1
+
+    if [ "$RTARGET_TYPE" = "ecs-via-bastion" ]; then
+        # Override remote_port with auto-detected container port
+        remote_port="${RTARGET_CONTAINER_PORT}"
+        echo ""
+        echo -e "${YELLOW}Starting tunnel via bastion: ${RTARGET_BASTION_NAME}${NC}"
+        echo "  ${RTARGET_PRIVATE_IP}:${remote_port} → localhost:${local_port}"
+        echo ""
+
+        local log_file="/tmp/ssm-tunnel-dns-${local_port}.log"
+        local _profile_flag=""
+        [ -n "$AWS_PROFILE" ] && _profile_flag="--profile $AWS_PROFILE"
+        nohup aws $_profile_flag ssm start-session \
+            --target "${RTARGET_BASTION_ID}" \
+            --document-name AWS-StartPortForwardingSessionToRemoteHost \
+            --parameters "{\"host\":[\"${RTARGET_PRIVATE_IP}\"],\"portNumber\":[\"${remote_port}\"],\"localPortNumber\":[\"${local_port}\"]}" \
+            > "$log_file" 2>&1 &
+
+        for i in $(seq 1 20); do
+            if nc -z localhost "${local_port}" 2>/dev/null; then
+                echo -e "${GREEN}✓ Tunnel active: localhost:${local_port} → ${RTARGET_PRIVATE_IP}:${remote_port} (via ${RTARGET_BASTION_NAME})${NC}"
+                echo "  Log: ${log_file}"
+                _tunnel_dns_proxy_setup "$tunnel_hostname" "$local_port"
+                return 0
+            fi
+            sleep 1
+        done
+        echo -e "${RED}✗ Failed to establish tunnel. Log:${NC}"
+        cat "$log_file"
+        exit 1
+    fi
+
+    # Existing direct SSM path (ec2/ecs with ECS Exec)
+    echo ""
+    echo -e "${YELLOW}Starting tunnel: ${RTARGET_LABEL} :${remote_port} → localhost:${local_port}${NC}"
+    echo "  Target: ${RTARGET_ID}"
+    echo ""
+
+    local log_file="/tmp/ssm-tunnel-dns-${local_port}.log"
+
+    local _profile_flag=""
+    [ -n "$AWS_PROFILE" ] && _profile_flag="--profile $AWS_PROFILE"
+    nohup aws $_profile_flag ssm start-session \
+        --target "${RTARGET_ID}" \
+        --document-name AWS-StartPortForwardingSession \
+        --parameters "{\"portNumber\":[\"${remote_port}\"],\"localPortNumber\":[\"${local_port}\"]}" \
+        > "$log_file" 2>&1 &
+
+    for i in $(seq 1 20); do
+        if nc -z localhost "${local_port}" 2>/dev/null; then
+            echo -e "${GREEN}✓ Tunnel active: localhost:${local_port} → ${RTARGET_LABEL}:${remote_port}${NC}"
+            echo "  Log: ${log_file}"
+            _tunnel_dns_proxy_setup "$tunnel_hostname" "$local_port"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo -e "${RED}✗ Failed to establish tunnel. Log:${NC}"
+    cat "$log_file"
+    exit 1
+}
+
+# --- Start tunnel to remote host via bastion EC2 (AWS-StartPortForwardingSessionToRemoteHost) ---
+tunnel_remote_start() {
+    local bastion="$1"
+    local remote_host="$2"
+    local local_port="$3"
+    local remote_port="${4:-8501}"
+
+    if [ -z "$bastion" ] || [ -z "$remote_host" ] || [ -z "$local_port" ]; then
+        echo -e "${RED}Usage: $0 tunnel-remote <bastion-pattern> <remote-host> <local_port> [remote_port]${NC}"
+        echo ""
+        echo "  Tunnels through a bastion EC2 instance to reach a remote host."
+        echo "  Uses AWS-StartPortForwardingSessionToRemoteHost (no ECS Exec needed)."
+        echo ""
+        echo "  bastion-pattern  Substring to match against EC2 instance Name tags"
+        echo "  remote-host      Private IP or hostname of the target (e.g. Fargate task)"
+        echo "  local_port       Local port to listen on"
+        echo "  remote_port      Port on the remote host (default: 8501)"
+        echo ""
+        echo "  Examples:"
+        echo "    $0 tunnel-remote bastion 10.0.1.42 8501"
+        echo "    $0 tunnel-remote bastion 10.0.1.42 8501 8501"
+        exit 1
+    fi
+
+    if nc -z localhost "${local_port}" 2>/dev/null; then
+        echo -e "${GREEN}✓ Port ${local_port} already in use (tunnel may be active)${NC}"
+        exit 0
+    fi
+
+    resolve_instance "$bastion"
+
+    echo -e "${YELLOW}Starting remote tunnel via ${TUNNEL_INSTANCE_NAME} (${TUNNEL_INSTANCE_ID})${NC}"
+    echo "  Remote host: ${remote_host}:${remote_port} → localhost:${local_port}"
+    echo ""
+
+    local log_file="/tmp/ssm-tunnel-remote-${local_port}.log"
+
+    local _profile_flag=""
+    [ -n "$AWS_PROFILE" ] && _profile_flag="--profile $AWS_PROFILE"
+    nohup aws $_profile_flag ssm start-session \
+        --target "${TUNNEL_INSTANCE_ID}" \
+        --document-name AWS-StartPortForwardingSessionToRemoteHost \
+        --parameters "{\"host\":[\"${remote_host}\"],\"portNumber\":[\"${remote_port}\"],\"localPortNumber\":[\"${local_port}\"]}" \
+        > "$log_file" 2>&1 &
+
+    for i in $(seq 1 20); do
+        if nc -z localhost "${local_port}" 2>/dev/null; then
+            echo -e "${GREEN}✓ Tunnel active: localhost:${local_port} → ${remote_host}:${remote_port} (via ${TUNNEL_INSTANCE_NAME})${NC}"
+            echo "  Log: ${log_file}"
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo -e "${RED}✗ Failed to establish tunnel. Log:${NC}"
+    cat "$log_file"
+    exit 1
 }
 
 # --- Main script logic: Parse command-line arguments ---
@@ -453,28 +2009,33 @@ usage() {
     echo "  update-ssh    - Updates ~/.ssh/config for the running instance (requires INSTANCE_NAME)"
     echo "  status        - Displays deployment information (requires INSTANCE_NAME)"
     echo ""
+    echo "Tools:"
+    echo "  login [profile] - AWS SSO login (uses \$AWS_PROFILE if no profile given)"
+    echo "  resolve <url>   - Resolve a URL/hostname to its EC2 instance(s)"
+    echo "                    Traces DNS → IP → EC2, or DNS → ALB → target group → EC2/Fargate"
+    echo ""
     echo "SSM Tunnel Commands:"
-    echo "  tunnel        - Start SSM port forwarding tunnel with socat relay"
-    echo "  tunnel-stop   - Stop the SSM tunnel and socat relay"
-    echo "  tunnel-test   - Test if the tunnel is working"
+    echo "  tunnel <pattern> <local_port> [remote_port]      - Tunnel to EC2 instance by name"
+    echo "  tunnel-dns <url> <local_port> [remote_port]      - Tunnel to EC2/Fargate by DNS"
+    echo "  tunnel-remote <bastion> <host> <local> [remote]  - Tunnel via bastion to remote host"
+    echo "  tunnel-stop                                      - Stop all SSM tunnels"
+    echo "  tunnel-test <local_port>                         - Test if a tunnel port is open"
+    echo ""
+    echo "  <pattern> matches running EC2 instance Name tags (*pattern*)"
+    echo "  <url> resolves DNS → ALB → target group → EC2 or Fargate task"
+    echo "  <bastion> matches bastion EC2 by Name tag; <host> is private IP of target"
+    echo "  <remote_port> defaults to 8000 (tunnel) or 8501 (tunnel-dns/tunnel-remote)"
     echo ""
     echo "Required Environment Variables:"
     echo "  AWS_DEFAULT_REGION or AWS_REGION  - AWS region"
     echo "  AWS_PROFILE or AWS_ACCESS_KEY_ID  - AWS credentials"
-    echo ""
-    echo "Tunnel Environment Variables:"
-    echo "  BASTION_INSTANCE_ID  - EC2 instance ID of the bastion host"
-    echo "  REMOTE_HOST          - Target host accessible from bastion"
-    echo "  REMOTE_PORT          - Target port (default: 80)"
-    echo "  LOCAL_PORT           - Local port to expose (default: 8080)"
-    echo "  HEALTH_URL           - Optional URL for tunnel-test health check"
     exit 1
 }
 
 if ! command -v jq &> /dev/null; then
     echo -e "${RED}'jq' is not installed. This script requires jq to reliably parse instance data.${NC}"
     echo "Please install it (e.g., 'sudo apt-get install jq' or 'brew install jq') and try again."; exit 1; fi
-if [ -z "$1" ]; then usage; fi
+if [ -z "$1" ]; then tui_main_loop; fi
 
 case "$1" in
     list) list_instances ;;
@@ -484,8 +2045,11 @@ case "$1" in
     switch) if [ -z "$2" ]; then echo -e "${RED}Error: The 'switch' command requires a second argument: 'gpu' or 'cpu'.${NC}"; usage; fi; switch_type "$2" ;;
     update-ssh) run_ssh_update ;;
     status) show_status ;;
-    tunnel) tunnel_start ;;
+    tunnel) tunnel_start "$2" "$3" ;;
     tunnel-stop) tunnel_stop ;;
-    tunnel-test) tunnel_test ;;
+    tunnel-dns) tunnel_dns_start "$2" "$3" "$4" ;;
+    tunnel-remote) tunnel_remote_start "$2" "$3" "$4" "$5" ;;
+    tunnel-test) tunnel_test "$2" ;;
+    resolve) resolve_dns "$2" ;;
     *) usage ;;
 esac
