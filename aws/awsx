@@ -870,7 +870,7 @@ list_instances() {
                 STATUS="down"
             fi
             # Shorten remote host for display
-            SHORT_HOST=$(echo "$REMOTE_H" | sed 's/\.internal\.yoii\.jp//' | sed 's/\.ml$//' | cut -c1-15)
+            SHORT_HOST=$(echo "$REMOTE_H" | sed 's/\.internal\.[^.]*\.[^.]*$//' | sed 's/\.ml$//' | cut -c1-15)
             echo "${INST_ID}=${LOCAL_P}|${SHORT_HOST}:${REMOTE_P}|${STATUS}"
         fi
     done)
@@ -1108,8 +1108,8 @@ tunnel_start() {
         echo "  remote_port   Remote port on the instance (default: 8000)"
         echo ""
         echo "  Examples:"
-        echo "    $0 tunnel dev-risk 18000        # dev-risk-model-ec2:8000 → localhost:18000"
-        echo "    $0 tunnel prod-risk 28000       # production-risk-model-ec2:8000 → localhost:28000"
+        echo "    $0 tunnel my-app 18000           # *my-app*:8000 → localhost:18000"
+        echo "    $0 tunnel web-server 28000      # *web-server*:8000 → localhost:28000"
         echo "    $0 tunnel myservice 9000 3000   # *myservice*:3000 → localhost:9000"
         exit 1
     fi
@@ -1259,7 +1259,7 @@ resolve_dns() {
         echo -e "${RED}Usage: $0 resolve <url-or-hostname>${NC}"
         echo ""
         echo "  Examples:"
-        echo "    $0 resolve http://dev.credit-calculator2.yoii.jp/"
+        echo "    $0 resolve http://app.dev.example.com/"
         echo "    $0 resolve api.example.com"
         exit 1
     fi
@@ -1858,7 +1858,7 @@ tunnel_dns_start() {
         echo "  Works with both EC2 instances and ECS Fargate tasks."
         echo ""
         echo "  Examples:"
-        echo "    $0 tunnel-dns http://dev.credit-calculator2.yoii.jp/ 8501"
+        echo "    $0 tunnel-dns http://app.dev.example.com/ 8501"
         echo "    $0 tunnel-dns api.example.com 3000 8080"
         exit 1
     fi
