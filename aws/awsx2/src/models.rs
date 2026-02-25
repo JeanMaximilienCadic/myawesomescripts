@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ── Domain models ─────────────────────────────────────────────────────────────
 
@@ -104,6 +104,35 @@ pub enum TunnelTarget {
         target_host: String,
         target_port: u16,
     },
+}
+
+// ── VPN configuration ────────────────────────────────────────────────────────
+
+/// Persisted VPN configuration (~/.config/awsx2/vpn.json)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnConfig {
+    pub sso_username: String,
+    pub sso_password: String,
+    pub ovpn_path: String,
+    #[serde(default = "default_dns_server")]
+    pub dns_server: String,
+    #[serde(default = "default_dns_domain")]
+    pub dns_domain: String,
+}
+
+fn default_dns_server() -> String { String::new() }
+fn default_dns_domain() -> String { String::new() }
+
+impl Default for VpnConfig {
+    fn default() -> Self {
+        Self {
+            sso_username: String::new(),
+            sso_password: String::new(),
+            ovpn_path: String::new(),
+            dns_server: default_dns_server(),
+            dns_domain: default_dns_domain(),
+        }
+    }
 }
 
 // ── Raw JSON deserialization structs (aws cli output) ─────────────────────────

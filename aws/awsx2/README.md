@@ -1,6 +1,6 @@
 # awsx2
 
-A fast AWS management CLI and interactive TUI built in Rust. Manages EC2 instances, SSM tunnels, and local reverse proxies through a single tool.
+A fast AWS management CLI and interactive TUI built in Rust. Manages EC2 instances, SSM tunnels, local reverse proxies, and AWS Client VPN with SAML authentication through a single tool.
 
 ```
 awsx2          # launch interactive TUI
@@ -12,6 +12,7 @@ awsx2 list     # CLI mode — list all instances
 - **Dual-mode** — full-screen TUI for interactive use, CLI for scripts and automation
 - **EC2 management** — list, start, stop, force-stop, switch instance types (GPU/CPU)
 - **Smart tunneling** — SSM port-forwarding with ALB-aware routing, security group analysis, and bastion fallback
+- **Client VPN** — AWS Client VPN with SAML/SSO authentication, headless browser MFA, and automatic DNS configuration
 - **Reverse proxy** — auto-configures nginx + `/etc/hosts` so internal URLs work directly in the browser
 - **Cross-platform** — macOS (Homebrew) and Linux (Debian/Ubuntu, RHEL/CentOS, Amazon Linux)
 
@@ -21,6 +22,8 @@ awsx2 list     # CLI mode — list all instances
 - [Session Manager Plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html)
 - SSM Agent running on target EC2 instances
 - nginx (only for `--proxy` feature)
+- Chromium/Chrome (only for `vpn connect` — headless SAML auth)
+- AWS VPN Client or OpenVPN (only for `vpn connect`)
 
 ## Installation
 
@@ -109,6 +112,38 @@ awsx2 tunnel-test 8080    # Check if port is open
 awsx2 tunnel-stop         # Kill all SSM tunnels + clean up proxies
 ```
 
+### VPN
+
+Connect to AWS Client VPN endpoints that use SAML/SSO authentication. Credentials are saved locally so you only need to enter the MFA code each time.
+
+```bash
+# One-time setup — saves credentials to ~/.config/awsx2/vpn.json
+awsx2 vpn setup \
+  --username user@example.com \
+  --password 'secret' \
+  --ovpn /path/to/client.ovpn \
+  --dns-server 10.0.0.2 \
+  --dns-domain '~internal.example.com'
+
+# Connect (prompts for MFA if not provided)
+sudo -E awsx2 vpn connect 123456
+
+# Check status
+awsx2 vpn status
+
+# Disconnect
+sudo -E awsx2 vpn disconnect
+```
+
+The connect flow:
+1. Sends initial auth to VPN server to obtain SAML challenge URL
+2. Launches headless Chromium to complete SSO login (username, password, MFA)
+3. Captures SAML response via local HTTP callback
+4. Reconnects to VPN with the SAML token (uses AWS patched OpenVPN if available)
+5. Configures DNS routing via `resolvectl` for the specified domain
+
+Requires `sudo -E` to create the tun interface and configure DNS. The `-E` flag preserves your AWS environment variables.
+
 ## TUI
 
 Launch with `awsx2` (no arguments). Navigate with keyboard — no mouse required.
@@ -171,6 +206,20 @@ Available tools:
 - **Test Port** — check if a tunnel port is open
 - **Stop All Tunnels** — kill all SSM sessions
 
+### VPN Tab
+
+| Key | Action |
+|-----|--------|
+| `j` / `k` / `Up` / `Down` | Navigate menu |
+| `Enter` | Execute |
+| `r` | Refresh status |
+
+Available actions:
+- **Connect** — enter MFA code and connect to VPN
+- **Disconnect** — stop active VPN session
+- **Setup** — configure SSO credentials and .ovpn path (multi-step wizard)
+- **Status** — check VPN connection state, IP, and PID
+
 ## Reverse Proxy
 
 The `--proxy` flag on `tunnel-url` sets up nginx so the original hostname works in your browser over the SSM tunnel.
@@ -211,7 +260,8 @@ awsx2
 ├── aws.rs           # AWS CLI wrapper (EC2, SSM, ALB, SG, DNS)
 ├── tunnel.rs        # SSM tunnel lifecycle (start, detect, stop, probe)
 ├── proxy.rs         # nginx reverse proxy + /etc/hosts management
-├── models.rs        # Domain types (Instance, TunnelProcess, etc.)
+├── vpn.rs           # Client VPN with SAML auth (headless Chrome, config persistence)
+├── models.rs        # Domain types (Instance, TunnelProcess, VpnConfig, etc.)
 ├── error.rs         # Error types (AppError enum with thiserror)
 └── tui/
     ├── app.rs       # Application state, background task channels
@@ -219,7 +269,8 @@ awsx2
     └── pages/
         ├── instances.rs   # Instances tab (table + key handlers)
         ├── tunnels.rs     # Tunnels tab (table + creation wizards)
-        └── tools.rs       # Tools tab (menu + actions)
+        ├── tools.rs       # Tools tab (menu + actions)
+        └── vpn.rs         # VPN tab (connect, disconnect, setup)
 ```
 
 **Key design decisions:**
@@ -238,6 +289,12 @@ awsx2
 | `serde` + `serde_json` | AWS CLI JSON output parsing |
 | `thiserror` | Error type derivation |
 | `libc` | Unix signal handling (SIGTERM for tunnel cleanup) |
+| `headless_chrome` | Chrome DevTools Protocol for SAML browser automation |
+| `tiny_http` | Lightweight HTTP server for SAML callback listener |
+| `regex` | Parsing SAML URL and session ID from OpenVPN output |
+| `url` | URL parsing for SAML form data extraction |
+| `dirs` | Platform-correct config directory (`~/.config/awsx2/`) |
+| `tempfile` | Secure temporary files for OpenVPN configs and credentials |
 
 ## Environment Variables
 
