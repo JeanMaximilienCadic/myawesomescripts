@@ -244,7 +244,7 @@ pub fn handle_input(app: &mut App, tag: InputTag, value: String) {
             app.vpn_config.sso_password = value;
             app.popup = Popup::Input {
                 title: "Path to .ovpn file".into(),
-                placeholder: "e.g. /opt/code/YOII/client.ovpn".into(),
+                placeholder: "e.g. /path/to/client.ovpn".into(),
                 value: app.vpn_config.ovpn_path.clone(),
                 tag: InputTag::VpnSetupOvpnPath,
             };

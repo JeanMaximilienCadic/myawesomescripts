@@ -1,6 +1,7 @@
 //! VPN connection via AWS Client VPN with SAML authentication.
 //!
 //! Flow: openvpn → SAML URL → headless browser (SSO login) → SAML callback → VPN connect → DNS config.
+//! Supports both Linux and macOS.
 
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
@@ -13,7 +14,10 @@ use crate::error::{AppError, Result};
 use crate::models::VpnConfig;
 
 const SAML_LISTEN_PORT: u16 = 35001;
-const AWS_OVPN_DIR: &str = "/opt/awsvpnclient/Service/Resources/openvpn";
+
+fn is_macos() -> bool {
+    cfg!(target_os = "macos")
+}
 
 // ── Config persistence ───────────────────────────────────────────────────────
 
@@ -43,7 +47,6 @@ pub fn save_config(config: &VpnConfig) -> Result<()> {
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| AppError::Vpn(format!("Serialize error: {}", e)))?;
     std::fs::write(&path, &json)?;
-    // chmod 600 — contains password
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -52,20 +55,41 @@ pub fn save_config(config: &VpnConfig) -> Result<()> {
     Ok(())
 }
 
-// ── OpenVPN binary detection ─────────────────────────────────────────────────
+// ── OpenVPN binary detection (platform-aware) ────────────────────────────────
 
-fn aws_openvpn_available() -> bool {
-    let musl = format!("{}/ld-musl-x86_64.so.1", AWS_OVPN_DIR);
-    let acvc = format!("{}/acvc-openvpn", AWS_OVPN_DIR);
-    std::path::Path::new(&musl).exists() && std::path::Path::new(&acvc).exists()
+/// Paths to the AWS-patched OpenVPN binary bundled with AWS VPN Client.
+/// On Linux it uses a musl-linked binary with its own loader.
+/// On macOS it ships as a standard Mach-O binary inside the .app bundle.
+fn find_aws_openvpn() -> Option<Vec<String>> {
+    if is_macos() {
+        // macOS: AWS VPN Client ships openvpn inside the .app bundle
+        let candidates = [
+            "/Applications/AWS VPN Client.app/Contents/Resources/openvpn/acvc-openvpn",
+            "/Applications/AWS VPN Client/AWS VPN Client.app/Contents/Resources/openvpn/acvc-openvpn",
+        ];
+        for path in candidates {
+            if std::path::Path::new(path).exists() {
+                return Some(vec![path.to_string()]);
+            }
+        }
+    } else {
+        // Linux: musl-linked binary needs the bundled loader
+        let dir = "/opt/awsvpnclient/Service/Resources/openvpn";
+        let musl = format!("{}/ld-musl-x86_64.so.1", dir);
+        let acvc = format!("{}/acvc-openvpn", dir);
+        if std::path::Path::new(&musl).exists() && std::path::Path::new(&acvc).exists() {
+            return Some(vec![musl, "--library-path".into(), dir.into(), acvc]);
+        }
+    }
+    None
 }
 
 fn openvpn_cmd(config_path: &str, creds_path: &str) -> Command {
-    if aws_openvpn_available() {
-        let musl = format!("{}/ld-musl-x86_64.so.1", AWS_OVPN_DIR);
-        let acvc = format!("{}/acvc-openvpn", AWS_OVPN_DIR);
-        let mut cmd = Command::new(musl);
-        cmd.args(["--library-path", AWS_OVPN_DIR, &acvc]);
+    if let Some(args) = find_aws_openvpn() {
+        let mut cmd = Command::new(&args[0]);
+        for arg in &args[1..] {
+            cmd.arg(arg);
+        }
         cmd.args(["--config", config_path, "--auth-user-pass", creds_path, "--verb", "3"]);
         cmd
     } else {
@@ -124,7 +148,6 @@ pub fn fetch_saml_challenge(ovpn_config_path: &str) -> Result<SamlChallenge> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    // Wait up to 20 seconds for openvpn to exit (it will fail auth and exit)
     let start = Instant::now();
     loop {
         match child.try_wait()? {
@@ -185,7 +208,6 @@ fn wait_for_saml_callback(timeout: Duration) -> Result<String> {
 
         match server.recv_timeout(Duration::from_secs(1)) {
             Ok(Some(mut request)) => {
-                // Try POST body first, then query string
                 let mut body = String::new();
                 let _ = request.as_reader().read_to_string(&mut body);
 
@@ -254,7 +276,6 @@ fn complete_saml_auth(
         .new_tab()
         .map_err(|e| AppError::Browser(format!("Failed to create tab: {}", e)))?;
 
-    // Navigate to SAML URL
     tab.navigate_to(saml_url)
         .map_err(|e| AppError::Browser(format!("Navigation failed: {}", e)))?;
     tab.wait_until_navigated()
@@ -263,28 +284,26 @@ fn complete_saml_auth(
     std::thread::sleep(Duration::from_secs(3));
 
     // Step A: Username
-    let username_selectors = &[
+    fill_field_and_submit(&tab, &[
         "input[type='email']",
         "input[name='username']",
         "input[name='email']",
         "#awsui-input-0",
         "input[data-testid='username-input']",
-    ];
-    fill_field_and_submit(&tab, username_selectors, sso_user)?;
+    ], sso_user)?;
     std::thread::sleep(Duration::from_secs(3));
 
     // Step B: Password
-    let password_selectors = &[
+    fill_field_and_submit(&tab, &[
         "input[type='password']",
         "input[name='password']",
         "#awsui-input-1",
         "input[data-testid='password-input']",
-    ];
-    fill_field_and_submit(&tab, password_selectors, sso_pass)?;
+    ], sso_pass)?;
     std::thread::sleep(Duration::from_secs(4));
 
     // Step C: MFA
-    let mfa_selectors = &[
+    fill_field_and_submit(&tab, &[
         "input[placeholder='Enter code']",
         "input[placeholder*='code']",
         "input[name='mfaCode']",
@@ -292,8 +311,7 @@ fn complete_saml_auth(
         "input[type='tel']",
         "input[data-testid='mfa-code-input']",
         "input[inputmode='numeric']",
-    ];
-    fill_field_and_submit(&tab, mfa_selectors, mfa_code)?;
+    ], mfa_code)?;
     std::thread::sleep(Duration::from_secs(4));
 
     // Check if page has SAMLResponse form and submit it
@@ -320,7 +338,6 @@ fn fill_field_and_submit(
                 .map_err(|e| AppError::Browser(format!("Type failed: {}", e)))?;
             std::thread::sleep(Duration::from_millis(500));
 
-            // Try submit buttons
             let submit_selectors = [
                 "button[type='submit']",
                 "input[type='submit']",
@@ -338,12 +355,10 @@ fn fill_field_and_submit(
                 let _ = tab.press_key("Enter");
             }
 
-            // Wait for navigation
             let _ = tab.wait_until_navigated();
             return Ok(());
         }
     }
-    // Field not found — might not be present (e.g., no MFA step), not an error
     Ok(())
 }
 
@@ -354,8 +369,6 @@ fn start_vpn_process(
     sid: &str,
     saml_response: &str,
 ) -> Result<(u32, tempfile::NamedTempFile, tempfile::NamedTempFile)> {
-    // We need to keep the temp config alive because we passed ovpn_config_path from
-    // a NamedTempFile in the caller. But here we just create the creds file.
     let creds = write_creds("N/A", &format!("CRV1::{}::{}", sid, saml_response))?;
 
     let child = openvpn_cmd(ovpn_config_path, creds.path().to_str().unwrap())
@@ -364,82 +377,162 @@ fn start_vpn_process(
         .spawn()?;
 
     let pid = child.id();
-    std::mem::forget(child); // Detach — same pattern as tunnel.rs
+    std::mem::forget(child);
 
-    // Return creds so caller can keep them alive
-    // Config tempfile must also stay alive — caller manages that
-    // We create a dummy for the config slot
     let dummy = tempfile::NamedTempFile::new()?;
     Ok((pid, creds, dummy))
 }
 
-// ── Phase 5: DNS configuration ───────────────────────────────────────────────
+// ── Phase 5: TUN interface detection (platform-aware) ────────────────────────
+
+/// Find the active TUN/UTUN interface name.
+/// Linux: tun0, tun1, etc.
+/// macOS: utun0, utun1, utun2, etc. (utun0 is often used by the system)
+fn find_tun_interface() -> Option<String> {
+    if is_macos() {
+        // macOS: check utun interfaces (skip utun0 which is often system-reserved)
+        let output = Command::new("ifconfig")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let re = Regex::new(r"(utun\d+):.*\n(?:.*\n)*?.*inet (\d+\.\d+\.\d+\.\d+)").ok()?;
+        // Return the last utun with an IP (most recently created = VPN)
+        let mut last_match = None;
+        for cap in re.captures_iter(&stdout) {
+            last_match = Some(cap[1].to_string());
+        }
+        last_match
+    } else {
+        // Linux: check tun0, tun1, etc.
+        for i in 0..8 {
+            let iface = format!("tun{}", i);
+            let status = Command::new("ip")
+                .args(["link", "show", &iface])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if status.map_or(false, |s| s.success()) {
+                return Some(iface);
+            }
+        }
+        None
+    }
+}
+
+// ── Phase 6: DNS configuration (platform-aware) ─────────────────────────────
 
 pub fn configure_dns(dns_server: &str, dns_domain: &str) -> Result<()> {
     if dns_server.is_empty() || dns_domain.is_empty() {
-        // No DNS config specified — skip silently
         return Ok(());
     }
-    // Wait for tun0 to come up (up to 20 seconds)
+
+    // Wait for TUN interface to come up
     let start = Instant::now();
-    let mut tun_up = false;
+    let mut tun_iface = None;
     while start.elapsed() < Duration::from_secs(20) {
-        let status = Command::new("ip")
-            .args(["link", "show", "tun0"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if status.map_or(false, |s| s.success()) {
-            tun_up = true;
+        if let Some(iface) = find_tun_interface() {
+            tun_iface = Some(iface);
             break;
         }
         std::thread::sleep(Duration::from_secs(1));
     }
-    if !tun_up {
-        return Err(AppError::Vpn("tun0 did not come up within 20 seconds".into()));
-    }
+    let tun_iface = tun_iface
+        .ok_or_else(|| AppError::Vpn("TUN interface did not come up within 20 seconds".into()))?;
 
-    // Give it a moment to stabilize
     std::thread::sleep(Duration::from_secs(1));
 
+    if is_macos() {
+        configure_dns_macos(dns_server, dns_domain, &tun_iface)
+    } else {
+        configure_dns_linux(dns_server, dns_domain, &tun_iface)
+    }
+}
+
+fn configure_dns_linux(dns_server: &str, dns_domain: &str, iface: &str) -> Result<()> {
     let _ = Command::new("resolvectl")
-        .args(["dns", "tun0", dns_server])
+        .args(["dns", iface, dns_server])
         .status()
         .map_err(|e| AppError::Vpn(format!("resolvectl dns failed: {}", e)))?;
 
     let _ = Command::new("resolvectl")
-        .args(["domain", "tun0", dns_domain])
+        .args(["domain", iface, dns_domain])
         .status()
         .map_err(|e| AppError::Vpn(format!("resolvectl domain failed: {}", e)))?;
 
     let _ = Command::new("resolvectl")
-        .args(["default-route", "tun0", "false"])
+        .args(["default-route", iface, "false"])
         .status();
 
     Ok(())
 }
 
-// ── Status detection ─────────────────────────────────────────────────────────
+fn configure_dns_macos(dns_server: &str, dns_domain: &str, _iface: &str) -> Result<()> {
+    // Strip the ~ prefix from the domain for the resolver config
+    let domain = dns_domain.trim_start_matches('~');
+
+    // macOS: create a resolver configuration file in /etc/resolver/
+    // This tells macOS to route DNS queries for the specified domain to our DNS server.
+    let resolver_dir = "/etc/resolver";
+    let _ = Command::new("sudo")
+        .args(["mkdir", "-p", resolver_dir])
+        .status();
+
+    let resolver_content = format!("nameserver {}\n", dns_server);
+    let resolver_path = format!("{}/{}", resolver_dir, domain);
+
+    let mut child = Command::new("sudo")
+        .args(["tee", &resolver_path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .map_err(|e| AppError::Vpn(format!("Failed to write resolver config: {}", e)))?;
+    if let Some(ref mut stdin) = child.stdin {
+        let _ = stdin.write_all(resolver_content.as_bytes());
+    }
+    let _ = child.wait();
+
+    // Flush DNS cache
+    let _ = Command::new("sudo")
+        .args(["dscacheutil", "-flushcache"])
+        .status();
+    let _ = Command::new("sudo")
+        .args(["killall", "-HUP", "mDNSResponder"])
+        .status();
+
+    Ok(())
+}
+
+// ── Status detection (platform-aware) ────────────────────────────────────────
 
 pub fn is_connected() -> bool {
-    Command::new("ip")
-        .args(["link", "show", "tun0"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_or(false, |s| s.success())
+    find_tun_interface().is_some()
 }
 
 pub fn get_vpn_ip() -> Option<String> {
-    let output = Command::new("ip")
-        .args(["-4", "addr", "show", "tun0"])
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let iface = find_tun_interface()?;
     let re = Regex::new(r"inet (\d+\.\d+\.\d+\.\d+)").ok()?;
-    re.captures(&stdout)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
+
+    if is_macos() {
+        let output = Command::new("ifconfig")
+            .arg(&iface)
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        re.captures(&stdout)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+    } else {
+        let output = Command::new("ip")
+            .args(["-4", "addr", "show", &iface])
+            .output()
+            .ok()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        re.captures(&stdout)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+    }
 }
 
 pub fn find_vpn_pid() -> Option<u32> {
@@ -461,19 +554,38 @@ pub fn disconnect() {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
     }
-    // Also try pkill as fallback
-    let _ = Command::new("pkill").args(["-f", "acvc-openvpn"]).status();
+    // Fallback: kill by process name pattern
+    let _ = Command::new("pkill")
+        .args(["-f", "acvc-openvpn|openvpn.*--config"])
+        .status();
+
+    // macOS: clean up resolver files created by configure_dns_macos and flush DNS
+    if is_macos() {
+        if let Ok(config) = load_config() {
+            if !config.dns_domain.is_empty() {
+                let domain = config.dns_domain.trim_start_matches('~');
+                let resolver_path = format!("/etc/resolver/{}", domain);
+                let _ = Command::new("sudo")
+                    .args(["rm", "-f", &resolver_path])
+                    .status();
+            }
+        }
+        let _ = Command::new("sudo")
+            .args(["dscacheutil", "-flushcache"])
+            .status();
+        let _ = Command::new("sudo")
+            .args(["killall", "-HUP", "mDNSResponder"])
+            .status();
+    }
 }
 
 // ── High-level orchestration ─────────────────────────────────────────────────
 
 /// Full VPN connection flow. Returns the openvpn PID on success.
-/// `progress` callback is called with status messages for UI feedback.
 pub fn connect<F>(config: &VpnConfig, mfa_code: &str, mut progress: F) -> Result<u32>
 where
     F: FnMut(&str),
 {
-    // Validate config
     if config.ovpn_path.is_empty() {
         return Err(AppError::Vpn("No .ovpn file path configured. Run 'awsx2 vpn setup' first.".into()));
     }
@@ -481,19 +593,16 @@ where
         return Err(AppError::Vpn("SSO credentials not configured. Run 'awsx2 vpn setup' first.".into()));
     }
 
-    // 1. Prepare modified .ovpn config
     progress("[1/5] Preparing VPN config...");
     let modified_config = prepare_ovpn_config(&config.ovpn_path)?;
     let config_path = modified_config.path().to_str().unwrap().to_string();
 
-    // 2. Get SAML challenge from VPN server
     progress("[2/5] Fetching SAML URL from VPN server...");
     let challenge = fetch_saml_challenge(&config_path)?;
     progress(&format!("  SAML URL received ({} chars), SID: {}...",
         challenge.saml_url.len(),
         &challenge.sid[..challenge.sid.len().min(30)]));
 
-    // 3. Start SAML callback listener + browser in parallel
     progress("[3/5] Completing SAML authentication (headless browser)...");
 
     let saml_url = challenge.saml_url.clone();
@@ -501,28 +610,22 @@ where
     let pass = config.sso_password.clone();
     let mfa = mfa_code.to_string();
 
-    // Browser thread
     let browser_handle = std::thread::spawn(move || {
         complete_saml_auth(&saml_url, &user, &pass, &mfa)
     });
 
-    // SAML callback listener (blocks until response or timeout)
     let saml_response = wait_for_saml_callback(Duration::from_secs(120))?;
     progress(&format!("  SAML response captured ({} chars)", saml_response.len()));
 
-    // Wait for browser to finish
     let _ = browser_handle.join().map_err(|_| AppError::Browser("Browser thread panicked".into()))?;
 
-    // 4. Connect VPN with SAML token
     progress("[4/5] Connecting VPN with SAML token...");
     let (pid, _creds, _dummy) = start_vpn_process(&config_path, &challenge.sid, &saml_response)?;
 
-    // Keep temp files alive by leaking them (they must outlive the openvpn process)
     std::mem::forget(modified_config);
     std::mem::forget(_creds);
 
-    // 5. Configure DNS
-    progress("[5/5] Waiting for tun0 and configuring DNS...");
+    progress("[5/5] Waiting for TUN interface and configuring DNS...");
     configure_dns(&config.dns_server, &config.dns_domain)?;
 
     let ip = get_vpn_ip().unwrap_or_else(|| "unknown".into());
