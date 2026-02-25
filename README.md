@@ -22,7 +22,7 @@
 
 | Module | Description |
 | --- | --- |
-| **aws/** | AWS management tools &mdash; EC2 instance lifecycle and S3 bucket mounting |
+| **aws/** | AWS management tools &mdash; EC2 instance management, SSM tunneling, and S3 bucket mounting (awsx2: Rust CLI + TUI) |
 | **backup/** | Backup and file management &mdash; smart backups, file organizer, duplicate finder |
 | **development/** | Development automation &mdash; git cleanup, project init, code stats, LLM-powered commits |
 | **docker/** | Docker utilities &mdash; ECR image cleanup |
@@ -38,7 +38,16 @@
 ```
 myawesomescripts/
 ├── aws/
-│   ├── awsx                           # EC2 instance management (start/stop/switch/ssh)
+│   ├── awsx2/                         # Rust CLI + TUI for EC2, SSM tunnels, reverse proxy
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── main.rs                # Entry point, CLI (clap) + TUI event loop
+│   │       ├── aws.rs                 # AWS CLI wrapper (EC2, SSM, ALB, SG, DNS)
+│   │       ├── tunnel.rs              # SSM tunnel lifecycle (start, detect, stop, probe)
+│   │       ├── proxy.rs               # nginx reverse proxy + /etc/hosts management
+│   │       ├── models.rs              # Domain types (Instance, TunnelProcess, etc.)
+│   │       ├── error.rs               # Error types (AppError enum with thiserror)
+│   │       └── tui/                   # Interactive terminal UI (ratatui)
 │   └── s3/
 │       └── mount_s3                   # Mount S3 buckets via rclone
 ├── backup/
@@ -84,7 +93,8 @@ myawesomescripts/
 
 All scripts in this repository follow a consistent set of conventions:
 
-- **Portable Bash** &mdash; Scripts target `#!/bin/bash` and rely on common Unix utilities (`curl`, `jq`, `rsync`, `tar`, etc.). No exotic interpreters are required.
+- **Portable Bash** &mdash; Shell scripts target `#!/bin/bash` and rely on common Unix utilities (`curl`, `jq`, `rsync`, `tar`, etc.). No exotic interpreters are required.
+- **Rust where it matters** &mdash; Performance-critical tools (awsx2) are written in Rust with `cargo build --release` for fast, type-safe binaries.
 - **Colored output** &mdash; Every interactive script defines ANSI color variables (`RED`, `GREEN`, `YELLOW`, etc.) and resets with `NC` for readable terminal output.
 - **Fail-fast with `set -e`** &mdash; Scripts exit immediately on errors to prevent cascading failures.
 - **Dry-run support** &mdash; Destructive operations (backups, file moves, deletions, git cleanup) offer a `--dry-run` / `-n` flag so users can preview changes safely.
@@ -98,8 +108,9 @@ All scripts in this repository follow a consistent set of conventions:
 
 - **Bash 4+** (for associative arrays used in several scripts)
 - **Git** (for development tools)
-- **AWS CLI** (for `aws/` scripts)
-- **jq** (JSON parsing in AWS and gitit scripts)
+- **AWS CLI v2** (for `aws/` scripts)
+- **Rust / Cargo** (for building `aws/awsx2`)
+- **jq** (JSON parsing in gitit scripts)
 - **curl** (used across network and development scripts)
 - **rsync** (for smart-backup sync and incremental modes)
 - **Docker** (for `docker/` scripts)
@@ -124,6 +135,9 @@ sudo apt-get install jq curl wget rsync netcat-openbsd bc tree
 
 | Dependency | Required by |
 | --- | --- |
+| `cargo` (Rust) | `aws/awsx2` (build) |
+| [Session Manager Plugin](https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html) | `aws/awsx2` (SSM tunnels) |
+| `nginx` | `aws/awsx2` (`--proxy` feature) |
 | `uv` (Python) | `python/uvx` |
 | `rclone` | `aws/s3/mount_s3` |
 | `s3fs` | `virtualization/lxd/sbin/mount_s3fs` |
@@ -138,7 +152,9 @@ The following environment variables are used across scripts:
 
 | Variable | Used by | Description |
 | --- | --- | --- |
-| `INSTANCE_NAME` | `aws/awsx` | Name tag of the target EC2 instance |
+| `AWS_PROFILE` | `aws/awsx2` | Default AWS profile for all operations |
+| `AWS_DEFAULT_REGION` | `aws/awsx2` | Default AWS region |
+| `INSTANCE_NAME` | `aws/awsx2` | Default instance name for CLI commands |
 | `ECR_PREFIX` | `docker/remove_project_images.sh` | ECR repository prefix to filter images |
 | `LLM_PROVIDER` | `development/gitit` | LLM provider: `nvidia` (default) or `openai` |
 | `LLM_API_KEY` | `development/gitit` | API key for the LLM provider |
@@ -163,11 +179,29 @@ The following environment variables are used across scripts:
 ### AWS
 
 ```bash
-# Manage EC2 instances
-export INSTANCE_NAME="my-instance"
-./aws/awsx status
-./aws/awsx start
-./aws/awsx switch gpu
+# Build awsx2
+cd aws/awsx2 && cargo build --release
+cp target/release/awsx2 /usr/local/bin/
+
+# Launch interactive TUI
+awsx2
+
+# CLI mode — manage EC2 instances
+awsx2 list
+awsx2 start --name my-instance
+awsx2 stop --name my-instance
+awsx2 switch gpu --name my-instance
+
+# SSM tunnels
+awsx2 tunnel web-server 8080 8000
+awsx2 tunnel-url https://app.internal.example.com 8080 --proxy
+awsx2 tunnel-stop
+
+# DNS resolution
+awsx2 resolve https://app.internal.example.com
+
+# SSO login
+awsx2 login my-profile
 ```
 
 ### Backup
