@@ -18,6 +18,12 @@ pub enum AppError {
     NoBastions,
     #[error("Port {0} is not open after timeout")]
     PortClosed(u16),
+    #[error("VPN error: {0}")]
+    Vpn(String),
+    #[error("SAML authentication failed: {0}")]
+    SamlAuth(String),
+    #[error("Browser automation error: {0}")]
+    Browser(String),
     #[allow(dead_code)]
     #[error("{0}")]
     Other(String),

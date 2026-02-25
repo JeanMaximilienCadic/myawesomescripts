@@ -2,25 +2,27 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use crate::models::{Instance, TunnelProcess};
+use crate::models::{Instance, TunnelProcess, VpnConfig};
 
 // ── Tab ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab { Instances, Tunnels, Tools }
+pub enum Tab { Instances, Tunnels, Tools, Vpn }
+
+const TAB_COUNT: usize = 4;
 
 impl Tab {
     pub fn titles() -> &'static [&'static str] {
-        &["Instances", "Tunnels", "Tools"]
+        &["Instances", "Tunnels", "Tools", "VPN"]
     }
     pub fn index(self) -> usize {
-        match self { Self::Instances => 0, Self::Tunnels => 1, Self::Tools => 2 }
+        match self { Self::Instances => 0, Self::Tunnels => 1, Self::Tools => 2, Self::Vpn => 3 }
     }
     pub fn from_index(i: usize) -> Self {
-        match i { 1 => Self::Tunnels, 2 => Self::Tools, _ => Self::Instances }
+        match i { 1 => Self::Tunnels, 2 => Self::Tools, 3 => Self::Vpn, _ => Self::Instances }
     }
-    pub fn next(self) -> Self { Self::from_index((self.index() + 1) % 3) }
-    pub fn prev(self) -> Self { Self::from_index((self.index() + 3 - 1) % 3) }
+    pub fn next(self) -> Self { Self::from_index((self.index() + 1) % TAB_COUNT) }
+    pub fn prev(self) -> Self { Self::from_index((self.index() + TAB_COUNT - 1) % TAB_COUNT) }
 }
 
 // ── Popup / modal ─────────────────────────────────────────────────────────────
@@ -58,6 +60,10 @@ pub enum InputTag {
     TestPort,
     SwitchProfile,
     SwitchRegion,
+    VpnMfaCode,
+    VpnSetupUsername,
+    VpnSetupPassword,
+    VpnSetupOvpnPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +82,7 @@ pub enum BgMessage {
     TunnelsLoaded(Vec<TunnelProcess>),
     TunnelStarted(crate::error::Result<TunnelProcess>),
     ActionDone(crate::error::Result<String>),
+    VpnConnected(crate::error::Result<String>),
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -98,6 +105,11 @@ pub struct App {
 
     // Tools tab
     pub tool_selected: usize,
+
+    // VPN tab
+    pub vpn_selected: usize,
+    pub vpn_config: VpnConfig,
+    pub vpn_status: String,
 
     // Popup / modal
     pub popup: Popup,
@@ -145,6 +157,13 @@ impl App {
             tunnels: vec![],
             tunnel_selected: 0,
             tool_selected: 0,
+            vpn_selected: 0,
+            vpn_config: crate::vpn::load_config().unwrap_or_default(),
+            vpn_status: if crate::vpn::is_connected() {
+                format!("CONNECTED ({})", crate::vpn::get_vpn_ip().unwrap_or_else(|| "?".into()))
+            } else {
+                "DISCONNECTED".into()
+            },
             popup: Popup::None,
             loading: false,
             loading_message: String::new(),
@@ -216,6 +235,18 @@ impl App {
                 }
                 BgMessage::ActionDone(Err(e)) => {
                     self.popup = Popup::Result { title: "Error".into(), body: e.to_string(), is_error: true };
+                }
+                BgMessage::VpnConnected(Ok(msg)) => {
+                    self.vpn_status = if crate::vpn::is_connected() {
+                        format!("CONNECTED ({})", crate::vpn::get_vpn_ip().unwrap_or_else(|| "?".into()))
+                    } else {
+                        "DISCONNECTED".into()
+                    };
+                    self.popup = Popup::Result { title: "VPN".into(), body: msg, is_error: false };
+                }
+                BgMessage::VpnConnected(Err(e)) => {
+                    self.vpn_status = "DISCONNECTED".into();
+                    self.popup = Popup::Result { title: "VPN Error".into(), body: e.to_string(), is_error: true };
                 }
             }
         }

@@ -146,6 +146,7 @@ fn render_body(f: &mut Frame, app: &App, area: Rect) {
         Tab::Instances => pages::instances::render(f, app, area),
         Tab::Tunnels   => pages::tunnels::render(f, app, area),
         Tab::Tools     => pages::tools::render(f, app, area),
+        Tab::Vpn       => pages::vpn::render(f, app, area),
     }
 }
 
@@ -156,6 +157,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         Tab::Instances => " [Tab] Switch  [s] Start  [S] Stop  [f] Force-stop  [r] Refresh  [/] Filter  [?] Help  [q] Quit",
         Tab::Tunnels   => " [Tab] Switch  [n] By instance  [u] By URL  [b] Via bastion  [d] Stop  [A] Stop all  [r] Refresh  [?] Help  [q] Quit",
         Tab::Tools     => " [Tab] Switch  [j/k] Navigate  [Enter] Execute  [?] Help  [q] Quit",
+        Tab::Vpn       => " [Tab] Switch  [j/k] Navigate  [Enter] Execute  [r] Refresh status  [?] Help  [q] Quit",
     };
 
     let text = if let Some(ref msg) = app.status_msg {

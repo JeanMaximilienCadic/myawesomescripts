@@ -9,11 +9,12 @@ mod models;
 mod proxy;
 mod tunnel;
 mod tui;
+mod vpn;
 
 use std::io;
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, Args};
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
@@ -116,6 +117,45 @@ enum Cmd {
     TunnelTest {
         local_port: u16,
     },
+    /// AWS Client VPN management (SAML authentication)
+    Vpn {
+        #[command(subcommand)]
+        action: VpnAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum VpnAction {
+    /// Connect to VPN (prompts for MFA code)
+    Connect {
+        /// MFA/TOTP code from your authenticator app
+        mfa: Option<String>,
+    },
+    /// Disconnect active VPN
+    Disconnect,
+    /// Show VPN connection status
+    Status,
+    /// Configure VPN credentials and .ovpn file path
+    Setup(VpnSetupArgs),
+}
+
+#[derive(Args)]
+struct VpnSetupArgs {
+    /// SSO username/email
+    #[arg(long)]
+    username: Option<String>,
+    /// SSO password
+    #[arg(long)]
+    password: Option<String>,
+    /// Path to .ovpn config file
+    #[arg(long)]
+    ovpn: Option<String>,
+    /// DNS server IP for VPN (e.g. 10.0.0.2)
+    #[arg(long)]
+    dns_server: Option<String>,
+    /// DNS routing domain for VPN (e.g. ~internal.example.com)
+    #[arg(long)]
+    dns_domain: Option<String>,
 }
 
 const GPU_TYPE: &str = "g4dn.4xlarge";
@@ -317,6 +357,84 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 std::process::exit(1);
             }
         }
+
+        Cmd::Vpn { action } => {
+            match action {
+                VpnAction::Setup(args) => {
+                    let mut config = vpn::load_config()?;
+                    if let Some(u) = args.username { config.sso_username = u; }
+                    if let Some(p) = args.password { config.sso_password = p; }
+                    if let Some(o) = args.ovpn { config.ovpn_path = o; }
+                    if let Some(d) = args.dns_server { config.dns_server = d; }
+                    if let Some(d) = args.dns_domain { config.dns_domain = d; }
+                    // Interactive prompts for missing fields
+                    if config.sso_username.is_empty() {
+                        eprint!("SSO Username/Email: ");
+                        let mut s = String::new();
+                        std::io::stdin().read_line(&mut s)?;
+                        config.sso_username = s.trim().to_string();
+                    }
+                    if config.sso_password.is_empty() {
+                        eprint!("SSO Password: ");
+                        let mut s = String::new();
+                        std::io::stdin().read_line(&mut s)?;
+                        config.sso_password = s.trim().to_string();
+                    }
+                    if config.ovpn_path.is_empty() {
+                        eprint!("Path to .ovpn file: ");
+                        let mut s = String::new();
+                        std::io::stdin().read_line(&mut s)?;
+                        config.ovpn_path = s.trim().to_string();
+                    }
+                    vpn::save_config(&config)?;
+                    let path = dirs::config_dir()
+                        .unwrap_or_default()
+                        .join("awsx2")
+                        .join("vpn.json");
+                    println!("VPN config saved to {}", path.display());
+                    println!("  Username: {}", config.sso_username);
+                    println!("  OVPN:     {}", config.ovpn_path);
+                    println!("  DNS:      {} ({})", config.dns_server, config.dns_domain);
+                }
+                VpnAction::Connect { mfa } => {
+                    let config = vpn::load_config()?;
+                    let mfa_code = match mfa {
+                        Some(code) => code,
+                        None => {
+                            eprint!("MFA Code: ");
+                            let mut s = String::new();
+                            std::io::stdin().read_line(&mut s)?;
+                            s.trim().to_string()
+                        }
+                    };
+                    if mfa_code.is_empty() {
+                        eprintln!("MFA code is required.");
+                        std::process::exit(1);
+                    }
+                    let pid = vpn::connect(&config, &mfa_code, |msg| println!("{}", msg))?;
+                    let ip = vpn::get_vpn_ip().unwrap_or_else(|| "?".into());
+                    println!("\nVPN connected and running in background.");
+                    println!("  IP:  {}", ip);
+                    println!("  PID: {}", pid);
+                    println!("\nUse 'awsx2 vpn disconnect' to stop.");
+                }
+                VpnAction::Disconnect => {
+                    vpn::disconnect();
+                    println!("VPN disconnected.");
+                }
+                VpnAction::Status => {
+                    if vpn::is_connected() {
+                        let ip = vpn::get_vpn_ip().unwrap_or_else(|| "unknown".into());
+                        let pid = vpn::find_vpn_pid().map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+                        println!("VPN: CONNECTED");
+                        println!("  IP:  {}", ip);
+                        println!("  PID: {}", pid);
+                    } else {
+                        println!("VPN: DISCONNECTED");
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -504,6 +622,7 @@ fn handle_global_key(app: &mut App, key: KeyEvent) {
             Tab::Instances => pages::instances::handle_key(app, key),
             Tab::Tunnels   => pages::tunnels::handle_key(app, key),
             Tab::Tools     => pages::tools::handle_key(app, key),
+            Tab::Vpn       => pages::vpn::handle_key(app, key),
         },
     }
 }
@@ -525,6 +644,12 @@ fn dispatch_input(app: &mut App, tag: InputTag, value: String) {
         | InputTag::NewTunnelBastionLocalPort
         | InputTag::NewTunnelBastionRemotePort => {
             pages::tunnels::handle_input(app, tag, value);
+        }
+        InputTag::VpnMfaCode
+        | InputTag::VpnSetupUsername
+        | InputTag::VpnSetupPassword
+        | InputTag::VpnSetupOvpnPath => {
+            pages::vpn::handle_input(app, tag, value);
         }
     }
 }
