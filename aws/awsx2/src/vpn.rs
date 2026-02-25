@@ -6,6 +6,8 @@
 use std::io::{Read as _, Write as _};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -193,46 +195,7 @@ pub fn fetch_saml_challenge(ovpn_config_path: &str) -> Result<SamlChallenge> {
     Ok(SamlChallenge { saml_url, sid })
 }
 
-// ── Phase 2: SAML callback HTTP listener ─────────────────────────────────────
-
-fn wait_for_saml_callback(timeout: Duration) -> Result<String> {
-    let server = tiny_http::Server::http(format!("127.0.0.1:{}", SAML_LISTEN_PORT))
-        .map_err(|e| AppError::Vpn(format!("Cannot bind SAML listener on port {}: {}", SAML_LISTEN_PORT, e)))?;
-
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        if Instant::now() > deadline {
-            return Err(AppError::SamlAuth("SAML callback timeout (no response received)".into()));
-        }
-
-        match server.recv_timeout(Duration::from_secs(1)) {
-            Ok(Some(mut request)) => {
-                let mut body = String::new();
-                let _ = request.as_reader().read_to_string(&mut body);
-
-                let saml = extract_saml_from_form(&body)
-                    .or_else(|| extract_saml_from_query(request.url()));
-
-                let response = tiny_http::Response::from_string(
-                    "<html><body><h2>VPN auth complete. You can close this tab.</h2></body></html>",
-                )
-                .with_header(
-                    "Content-Type: text/html"
-                        .parse::<tiny_http::Header>()
-                        .unwrap(),
-                );
-                let _ = request.respond(response);
-
-                if let Some(saml) = saml {
-                    return Ok(saml);
-                }
-            }
-            Ok(None) => continue,
-            Err(e) => return Err(AppError::Vpn(format!("SAML listener error: {}", e))),
-        }
-    }
-}
+// ── Phase 2: SAML helpers ─────────────────────────────────────────────────────
 
 fn extract_saml_from_form(body: &str) -> Option<String> {
     url::form_urlencoded::parse(body.as_bytes())
@@ -362,6 +325,11 @@ fn fill_field_and_submit(
     Ok(())
 }
 
+fn open_url_in_browser(url: &str) {
+    let cmd = if is_macos() { "open" } else { "xdg-open" };
+    let _ = Command::new(cmd).arg(url).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
 // ── Phase 4: Connect VPN with SAML token ─────────────────────────────────────
 
 fn start_vpn_process(
@@ -370,17 +338,48 @@ fn start_vpn_process(
     saml_response: &str,
 ) -> Result<(u32, tempfile::NamedTempFile, tempfile::NamedTempFile)> {
     let creds = write_creds("N/A", &format!("CRV1::{}::{}", sid, saml_response))?;
+    let creds_path = creds.path().to_str().unwrap().to_string();
 
-    let child = openvpn_cmd(ovpn_config_path, creds.path().to_str().unwrap())
+    // Build the openvpn command, wrapping with sudo for TUN device creation
+    let mut cmd = if let Some(args) = find_aws_openvpn() {
+        let mut c = Command::new("sudo");
+        for arg in &args {
+            c.arg(arg);
+        }
+        c.args(["--config", ovpn_config_path, "--auth-user-pass", &creds_path, "--verb", "3"]);
+        c
+    } else {
+        let mut c = Command::new("sudo");
+        c.args(["openvpn", "--config", ovpn_config_path, "--auth-user-pass", &creds_path, "--verb", "3"]);
+        c
+    };
+
+    let stderr_log = tempfile::NamedTempFile::new()?;
+    let stderr_file = stderr_log.reopen()?;
+
+    let mut child = cmd
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr_file)
         .spawn()?;
+
+    // Give the process a moment to start, then check if it crashed immediately
+    std::thread::sleep(Duration::from_secs(2));
+    if let Ok(Some(status)) = child.try_wait() {
+        let mut log = String::new();
+        if let Ok(mut f) = std::fs::File::open(stderr_log.path()) {
+            let _ = f.read_to_string(&mut log);
+        }
+        let last_lines: String = log.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        return Err(AppError::Vpn(format!(
+            "openvpn exited immediately ({})\n{}",
+            status, last_lines
+        )));
+    }
 
     let pid = child.id();
     std::mem::forget(child);
 
-    let dummy = tempfile::NamedTempFile::new()?;
-    Ok((pid, creds, dummy))
+    Ok((pid, creds, stderr_log))
 }
 
 // ── Phase 5: TUN interface detection (platform-aware) ────────────────────────
@@ -390,20 +389,30 @@ fn start_vpn_process(
 /// macOS: utun0, utun1, utun2, etc. (utun0 is often used by the system)
 fn find_tun_interface() -> Option<String> {
     if is_macos() {
-        // macOS: check utun interfaces (skip utun0 which is often system-reserved)
         let output = Command::new("ifconfig")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
             .ok()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let re = Regex::new(r"(utun\d+):.*\n(?:.*\n)*?.*inet (\d+\.\d+\.\d+\.\d+)").ok()?;
-        // Return the last utun with an IP (most recently created = VPN)
-        let mut last_match = None;
-        for cap in re.captures_iter(&stdout) {
-            last_match = Some(cap[1].to_string());
+        let iface_re = Regex::new(r"(?m)^(\S+):").ok()?;
+        let inet_re = Regex::new(r"inet (\d+\.\d+\.\d+\.\d+)").ok()?;
+
+        // Split ifconfig output by interface block and find the last utun with IPv4
+        let starts: Vec<_> = iface_re.find_iter(&stdout).collect();
+        let mut last_vpn = None;
+        for (i, m) in starts.iter().enumerate() {
+            let name = m.as_str().trim_end_matches(':');
+            if !name.starts_with("utun") {
+                continue;
+            }
+            let block_end = starts.get(i + 1).map_or(stdout.len(), |n| n.start());
+            let block = &stdout[m.start()..block_end];
+            if inet_re.is_match(block) {
+                last_vpn = Some(name.to_string());
+            }
         }
-        last_match
+        last_vpn
     } else {
         // Linux: check tun0, tun1, etc.
         for i in 0..8 {
@@ -610,22 +619,119 @@ where
     let pass = config.sso_password.clone();
     let mfa = mfa_code.to_string();
 
+    let browser_failed = Arc::new(AtomicBool::new(false));
+    let bf = browser_failed.clone();
     let browser_handle = std::thread::spawn(move || {
-        complete_saml_auth(&saml_url, &user, &pass, &mfa)
+        let result = complete_saml_auth(&saml_url, &user, &pass, &mfa);
+        if result.is_err() {
+            bf.store(true, Ordering::SeqCst);
+        }
+        result
     });
 
-    let saml_response = wait_for_saml_callback(Duration::from_secs(120))?;
+    // Wait for SAML callback with system browser fallback.
+    // If headless Chrome fails or takes too long, open the real browser.
+    let server = tiny_http::Server::http(format!("127.0.0.1:{}", SAML_LISTEN_PORT))
+        .map_err(|e| AppError::Vpn(format!("Cannot bind SAML listener on port {}: {}", SAML_LISTEN_PORT, e)))?;
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let fallback_at = Instant::now() + Duration::from_secs(25);
+    let mut fallback_opened = false;
+
+    let saml_response = loop {
+        if Instant::now() > deadline {
+            return Err(AppError::SamlAuth("SAML callback timeout (no response received)".into()));
+        }
+
+        // Fall back to system browser if headless Chrome failed or is taking too long
+        if !fallback_opened
+            && (browser_failed.load(Ordering::SeqCst) || Instant::now() > fallback_at)
+        {
+            progress("  Headless browser did not complete. Opening system browser...");
+            open_url_in_browser(&challenge.saml_url);
+            fallback_opened = true;
+        }
+
+        match server.recv_timeout(Duration::from_secs(1)) {
+            Ok(Some(mut request)) => {
+                let mut body = String::new();
+                let _ = request.as_reader().read_to_string(&mut body);
+
+                let saml = extract_saml_from_form(&body)
+                    .or_else(|| extract_saml_from_query(request.url()));
+
+                let response = tiny_http::Response::from_string(
+                    "<html><body><h2>VPN auth complete. You can close this tab.</h2></body></html>",
+                )
+                .with_header(
+                    "Content-Type: text/html"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                );
+                let _ = request.respond(response);
+
+                if let Some(saml) = saml {
+                    break saml;
+                }
+            }
+            Ok(None) => continue,
+            Err(e) => return Err(AppError::Vpn(format!("SAML listener error: {}", e))),
+        }
+    };
+
     progress(&format!("  SAML response captured ({} chars)", saml_response.len()));
 
     let _ = browser_handle.join().map_err(|_| AppError::Browser("Browser thread panicked".into()))?;
 
-    progress("[4/5] Connecting VPN with SAML token...");
-    let (pid, _creds, _dummy) = start_vpn_process(&config_path, &challenge.sid, &saml_response)?;
+    progress("[4/5] Connecting VPN with SAML token (sudo required)...");
 
+    // Prime sudo credentials so the openvpn spawn doesn't silently wait for a password
+    let sudo_status = Command::new("sudo")
+        .args(["-v"])
+        .status()
+        .map_err(|e| AppError::Vpn(format!("sudo failed: {}", e)))?;
+    if !sudo_status.success() {
+        return Err(AppError::Vpn("sudo authentication failed".into()));
+    }
+
+    let (pid, _creds, _stderr_log) = start_vpn_process(&config_path, &challenge.sid, &saml_response)?;
+
+    // Keep temp files alive so openvpn can read them
     std::mem::forget(modified_config);
     std::mem::forget(_creds);
+    std::mem::forget(_stderr_log);
 
     progress("[5/5] Waiting for TUN interface and configuring DNS...");
+
+    // Wait for TUN interface to come up, checking that openvpn is still alive.
+    let start = Instant::now();
+    let mut tun_found = false;
+    while start.elapsed() < Duration::from_secs(20) {
+        if find_tun_interface().is_some() {
+            tun_found = true;
+            break;
+        }
+        // Check if the openvpn process died
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_or(false, |s| s.success());
+        if !alive {
+            return Err(AppError::Vpn(format!(
+                "openvpn process (PID {}) exited before TUN interface came up. \
+                 Try running with: sudo awsx2 vpn connect",
+                pid
+            )));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    if !tun_found {
+        return Err(AppError::Vpn("TUN interface did not come up within 20 seconds".into()));
+    }
+
     configure_dns(&config.dns_server, &config.dns_domain)?;
 
     let ip = get_vpn_ip().unwrap_or_else(|| "unknown".into());
