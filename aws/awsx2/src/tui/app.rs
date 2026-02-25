@@ -83,6 +83,7 @@ pub enum BgMessage {
     TunnelStarted(crate::error::Result<TunnelProcess>),
     ActionDone(crate::error::Result<String>),
     VpnConnected(crate::error::Result<String>),
+    VpnProgress(String),
 }
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -197,6 +198,13 @@ impl App {
 
     pub fn poll_bg(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
+            // VpnProgress keeps the loading state active
+            if matches!(msg, BgMessage::VpnProgress(_)) {
+                if let BgMessage::VpnProgress(text) = msg {
+                    self.popup = Popup::Loading { message: text };
+                }
+                continue;
+            }
             self.loading = false;
             match msg {
                 BgMessage::InstancesLoaded(Ok(instances)) => {
@@ -248,6 +256,7 @@ impl App {
                     self.vpn_status = "DISCONNECTED".into();
                     self.popup = Popup::Result { title: "VPN Error".into(), body: e.to_string(), is_error: true };
                 }
+                BgMessage::VpnProgress(_) => unreachable!(),
             }
         }
     }

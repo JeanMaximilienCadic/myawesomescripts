@@ -215,11 +215,12 @@ pub fn handle_input(app: &mut App, tag: InputTag, value: String) {
             let config = app.vpn_config.clone();
             let tx = app.tx.clone();
             app.popup = Popup::Loading {
-                message: "Connecting VPN (SAML auth)...".into(),
+                message: "[1/5] Preparing VPN config...".into(),
             };
+            let tx2 = tx.clone();
             std::thread::spawn(move || {
-                let result = crate::vpn::connect(&config, &mfa, |_msg| {
-                    // Progress messages are consumed silently in TUI mode
+                let result = crate::vpn::connect(&config, &mfa, |msg| {
+                    let _ = tx2.send(BgMessage::VpnProgress(msg.to_string()));
                 });
                 let msg = match &result {
                     Ok(pid) => {
