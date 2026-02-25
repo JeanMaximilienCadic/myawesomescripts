@@ -1,0 +1,21 @@
+[package]
+name = "awsx2"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "awsx2"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
