@@ -2,6 +2,12 @@
 name = "awsx2"
 version = "0.1.0"
 edition = "2021"
+description = "AWS management CLI and interactive TUI — EC2 lifecycle, SSM tunnels, ALB-aware routing, and nginx reverse proxy"
+license = "MIT"
+repository = "https://github.com/JeanMaximilienCadic/myawesomescripts"
+keywords = ["aws", "ec2", "ssm", "tui", "tunnel"]
+categories = ["command-line-utilities"]
+readme = "README.md"
 
 [[bin]]
 name = "awsx2"
