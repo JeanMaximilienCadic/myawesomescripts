@@ -140,6 +140,10 @@ fn write_creds(user: &str, pass: &str) -> Result<tempfile::NamedTempFile> {
 pub struct SamlChallenge {
     pub saml_url: String,
     pub sid: String,
+    /// The actual server IP:port from phase 1 (needed because remote-random-hostname
+    /// causes each connection to resolve to a different server, but the SAML session
+    /// is bound to the server that issued the challenge).
+    pub server_ip: Option<String>,
 }
 
 pub fn fetch_saml_challenge(ovpn_config_path: &str) -> Result<SamlChallenge> {
@@ -192,7 +196,15 @@ pub fn fetch_saml_challenge(ovpn_config_path: &str) -> Result<SamlChallenge> {
         .map(|m| m.as_str().to_string())
         .ok_or_else(|| AppError::SamlAuth("Could not extract session ID (CRV1:R:...)".into()))?;
 
-    Ok(SamlChallenge { saml_url, sid })
+    // Extract the actual server IP so phase 4 connects to the same server.
+    // remote-random-hostname causes DNS to resolve differently each time.
+    let ip_re = Regex::new(r"link remote: \[AF_INET\](\d+\.\d+\.\d+\.\d+:\d+)").unwrap();
+    let server_ip = ip_re
+        .captures(&combined)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
+
+    Ok(SamlChallenge { saml_url, sid, server_ip })
 }
 
 // ── Phase 2: SAML helpers ─────────────────────────────────────────────────────
@@ -200,7 +212,7 @@ pub fn fetch_saml_challenge(ovpn_config_path: &str) -> Result<SamlChallenge> {
 fn extract_saml_from_form(body: &str) -> Option<String> {
     url::form_urlencoded::parse(body.as_bytes())
         .find(|(key, _)| key == "SAMLResponse")
-        .map(|(_, val)| val.to_string())
+        .map(|(_, val)| val.replace(['\n', '\r', ' '], ""))
 }
 
 fn extract_saml_from_query(url_str: &str) -> Option<String> {
@@ -209,7 +221,7 @@ fn extract_saml_from_query(url_str: &str) -> Option<String> {
         .ok()?
         .query_pairs()
         .find(|(key, _)| key == "SAMLResponse")
-        .map(|(_, val)| val.to_string())
+        .map(|(_, val)| val.replace(['\n', '\r', ' '], ""))
 }
 
 // ── Phase 3: Browser automation (headless Chrome) ────────────────────────────
@@ -332,34 +344,87 @@ fn open_url_in_browser(url: &str) {
 
 // ── Phase 4: Connect VPN with SAML token ─────────────────────────────────────
 
+/// Pin the config to a specific server IP for phase 4 reconnection.
+/// remote-random-hostname causes each connection to resolve to a different server,
+/// but the SAML session is bound to the server that issued the challenge.
+fn pin_config_to_server(ovpn_config_path: &str, ip: &str, port: &str) -> Result<tempfile::NamedTempFile> {
+    let content = std::fs::read_to_string(ovpn_config_path)
+        .map_err(|e| AppError::Vpn(format!("Cannot read {}: {}", ovpn_config_path, e)))?;
+    let filtered: String = content
+        .lines()
+        .filter(|line| {
+            let l = line.trim();
+            !l.starts_with("remote ") && !l.starts_with("remote-random-hostname")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut tmp = tempfile::NamedTempFile::new()?;
+    write!(tmp, "{}\nremote {} {}\n", filtered, ip, port)?;
+    tmp.flush()?;
+    Ok(tmp)
+}
+
 fn start_vpn_process(
     ovpn_config_path: &str,
     sid: &str,
     saml_response: &str,
-) -> Result<(u32, tempfile::NamedTempFile, tempfile::NamedTempFile)> {
-    let creds = write_creds("N/A", &format!("CRV1::{}::{}", sid, saml_response))?;
+    server_ip: Option<&str>,
+) -> Result<(u32, tempfile::NamedTempFile, tempfile::NamedTempFile, Option<tempfile::NamedTempFile>)> {
+    let cred_password = format!("CRV1::{}::{}", sid, saml_response);
+    let creds = write_creds("N/A", &cred_password)?;
     let creds_path = creds.path().to_str().unwrap().to_string();
 
-    // Build the openvpn command, wrapping with sudo for TUN device creation
+    // If we know the server IP from phase 1, pin the config to that IP
+    let pinned_config = if let Some(ip_port) = server_ip {
+        if let Some((ip, port)) = ip_port.split_once(':') {
+            Some(pin_config_to_server(ovpn_config_path, ip, port)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let effective_config = pinned_config.as_ref()
+        .map(|f| f.path().to_str().unwrap())
+        .unwrap_or(ovpn_config_path);
+
+    // Build the openvpn command. Use sudo only if not already root.
+    let is_root = unsafe { libc::geteuid() } == 0;
     let mut cmd = if let Some(args) = find_aws_openvpn() {
-        let mut c = Command::new("sudo");
-        for arg in &args {
+        let (bin, rest) = if is_root {
+            (args[0].clone(), &args[1..])
+        } else {
+            ("sudo".to_string(), &args[..])
+        };
+        let mut c = Command::new(&bin);
+        for arg in rest {
             c.arg(arg);
         }
-        c.args(["--config", ovpn_config_path, "--auth-user-pass", &creds_path, "--verb", "3"]);
+        c.args(["--config", effective_config, "--auth-user-pass", &creds_path, "--verb", "3"]);
         c
     } else {
-        let mut c = Command::new("sudo");
-        c.args(["openvpn", "--config", ovpn_config_path, "--auth-user-pass", &creds_path, "--verb", "3"]);
-        c
+        if is_root {
+            let mut c = Command::new("openvpn");
+            c.args(["--config", effective_config, "--auth-user-pass", &creds_path, "--verb", "3"]);
+            c
+        } else {
+            let mut c = Command::new("sudo");
+            c.args(["openvpn", "--config", effective_config, "--auth-user-pass", &creds_path, "--verb", "3"]);
+            c
+        }
     };
 
     let stderr_log = tempfile::NamedTempFile::new()?;
     let stderr_file = stderr_log.reopen()?;
+    let stdout_log = tempfile::NamedTempFile::new()?;
+    let stdout_file = stdout_log.reopen()?;
 
+    use std::os::unix::process::CommandExt;
     let mut child = cmd
-        .stdout(Stdio::null())
+        .stdin(Stdio::null())
+        .stdout(stdout_file)
         .stderr(stderr_file)
+        .process_group(0) // detach into own process group
         .spawn()?;
 
     // Give the process a moment to start, then check if it crashed immediately
@@ -369,7 +434,10 @@ fn start_vpn_process(
         if let Ok(mut f) = std::fs::File::open(stderr_log.path()) {
             let _ = f.read_to_string(&mut log);
         }
-        let last_lines: String = log.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        if let Ok(mut f) = std::fs::File::open(stdout_log.path()) {
+            let _ = f.read_to_string(&mut log);
+        }
+        let last_lines: String = log.lines().rev().take(10).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
         return Err(AppError::Vpn(format!(
             "openvpn exited immediately ({})\n{}",
             status, last_lines
@@ -379,7 +447,7 @@ fn start_vpn_process(
     let pid = child.id();
     std::mem::forget(child);
 
-    Ok((pid, creds, stderr_log))
+    Ok((pid, creds, stderr_log, pinned_config))
 }
 
 // ── Phase 5: TUN interface detection (platform-aware) ────────────────────────
@@ -684,6 +752,10 @@ where
     let _ = browser_handle.join().map_err(|_| AppError::Browser("Browser thread panicked".into()))?;
 
     progress("[4/5] Connecting VPN with SAML token (sudo required)...");
+    let openvpn_type = if find_aws_openvpn().is_some() { "acvc-openvpn" } else { "stock openvpn" };
+    progress(&format!("  Using {}, pinned to server: {}",
+        openvpn_type,
+        challenge.server_ip.as_deref().unwrap_or("(DNS, not pinned)")));
 
     // Prime sudo credentials so the openvpn spawn doesn't silently wait for a password
     let sudo_status = Command::new("sudo")
@@ -694,12 +766,18 @@ where
         return Err(AppError::Vpn("sudo authentication failed".into()));
     }
 
-    let (pid, _creds, _stderr_log) = start_vpn_process(&config_path, &challenge.sid, &saml_response)?;
+    let (pid, _creds, _stderr_log, _pinned_config) = start_vpn_process(
+        &config_path,
+        &challenge.sid,
+        &saml_response,
+        challenge.server_ip.as_deref(),
+    )?;
 
     // Keep temp files alive so openvpn can read them
     std::mem::forget(modified_config);
     std::mem::forget(_creds);
     std::mem::forget(_stderr_log);
+    if let Some(pc) = _pinned_config { std::mem::forget(pc); }
 
     progress("[5/5] Waiting for TUN interface and configuring DNS...");
 
