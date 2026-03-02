@@ -308,7 +308,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 _ => {
                     // Fallback: try all SSM-online bastions directly
                     println!("  Trying bastions...");
-                    let tp = tunnel::start_url_tunnel_via_any_bastion(&url, local_port, None)?;
+                    let tp = tunnel::start_url_tunnel_via_any_bastion(&url, local_port, remote_port, None)?;
                     println!(
                         "Tunnel active: localhost:{} -> {} via {}",
                         tp.local_port, tp.remote_host.as_deref().unwrap_or("?"), tp.instance_name

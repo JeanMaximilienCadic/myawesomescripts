@@ -293,6 +293,6 @@ fn try_alb_tunnel_bg(host: &str, url: &str, local_port: u16, remote_port: Option
             }
         }
     }
-    // Fall back to bastions
-    crate::tunnel::start_url_tunnel_via_any_bastion(url, local_port, None)
+    // Fall back to bastions (auto-detect port if not specified)
+    crate::tunnel::start_url_tunnel_via_any_bastion(url, local_port, remote_port, None)
 }

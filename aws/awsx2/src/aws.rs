@@ -487,6 +487,74 @@ pub fn find_ssm_hop_by_sgs(allowed_sg_ids: &[String], profile: Option<&str>) -> 
         .find(|i| i.security_group_ids.iter().any(|sg| allowed_set.contains(sg.as_str()))))
 }
 
+/// Common service ports to probe when auto-detecting.
+pub const COMMON_PORTS: &[u16] = &[80, 443, 3000, 5000, 8000, 8080, 8443, 8501, 8888, 9000, 9090];
+
+/// Probe which ports are open on a remote host from a bastion via SSM
+/// send-command. Uses perl `IO::Socket::INET` (available on macOS, Amazon
+/// Linux, and Ubuntu) for portable TCP connect with timeout.
+pub fn probe_ports_via_bastion(
+    bastion_id: &str,
+    host: &str,
+    ports: &[u16],
+    profile: Option<&str>,
+) -> Result<Vec<u16>> {
+    let checks: Vec<String> = ports
+        .iter()
+        .map(|p| format!(
+            "perl -MIO::Socket::INET -e 'exit(IO::Socket::INET->new(PeerAddr=>$ARGV[0],PeerPort=>$ARGV[1],Timeout=>1)?0:1)' {} {} 2>/dev/null && echo {}",
+            host, p, p
+        ))
+        .collect();
+    let script = checks.join("; ");
+
+    let send_json = run_aws(
+        &[
+            "ssm", "send-command",
+            "--instance-ids", bastion_id,
+            "--document-name", "AWS-RunShellScript",
+            "--parameters", &format!("commands=[\"{}\"]", script),
+        ],
+        profile,
+    )?;
+    let send_val: serde_json::Value = serde_json::from_str(&send_json)?;
+    let command_id = send_val["Command"]["CommandId"]
+        .as_str()
+        .ok_or_else(|| AppError::AwsCli("send-command: no CommandId".to_string()))?
+        .to_string();
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    for _ in 0..10 {
+        let inv_json = run_aws(
+            &[
+                "ssm", "get-command-invocation",
+                "--command-id", &command_id,
+                "--instance-id", bastion_id,
+            ],
+            profile,
+        );
+        if let Ok(j) = inv_json {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&j) {
+                let status = val["Status"].as_str().unwrap_or("");
+                if status == "Success" || status == "Failed" {
+                    let out = val["StandardOutputContent"]
+                        .as_str()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    return Ok(out
+                        .lines()
+                        .filter_map(|line| line.trim().parse::<u16>().ok())
+                        .collect());
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+    Err(AppError::AwsCli("Port probe timed out after 23 s".to_string()))
+}
+
 /// Human-readable DNS → EC2 resolution report.
 pub fn resolve_dns_report(input: &str, profile: Option<&str>) -> Result<String> {
     use std::fmt::Write as _;

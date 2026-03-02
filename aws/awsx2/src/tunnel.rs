@@ -223,13 +223,41 @@ pub fn start_tunnel_by_pattern(
 pub fn start_url_tunnel_via_any_bastion(
     url: &str,
     local_port: u16,
+    remote_port: Option<u16>,
     profile: Option<&str>,
 ) -> Result<TunnelProcess> {
     let host = aws::strip_url_to_host(url);
-    let remote_port: u16 = if url.starts_with("https://") { 443 } else { 80 };
     let bastions = aws::find_bastions(profile)?;
     let online_bastions: Vec<_> = bastions.into_iter().filter(|b| b.ssm_online).collect();
     if online_bastions.is_empty() { return Err(AppError::NoBastions); }
+
+    // Determine remote port: explicit > auto-detect > scheme default
+    let remote_port = match remote_port {
+        Some(rp) => rp,
+        None => {
+            let default_port: u16 = if url.starts_with("https://") { 443 } else { 80 };
+            println!("  Auto-detecting port on {}...", host);
+            match aws::probe_ports_via_bastion(
+                &online_bastions[0].id, &host, aws::COMMON_PORTS, profile,
+            ) {
+                Ok(ref open) if !open.is_empty() => {
+                    println!(
+                        "  Open ports: {}",
+                        open.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+                    );
+                    if open.contains(&default_port) { default_port } else { open[0] }
+                }
+                Ok(_) => {
+                    println!("  No open ports found, falling back to {}", default_port);
+                    default_port
+                }
+                Err(e) => {
+                    println!("  Port probe failed ({}), falling back to {}", e, default_port);
+                    default_port
+                }
+            }
+        }
+    };
 
     for bastion in &online_bastions {
         let child = start_remote_tunnel(&bastion.id, &host, local_port, remote_port, profile)?;
