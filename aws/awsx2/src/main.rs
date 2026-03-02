@@ -28,7 +28,11 @@ use crate::tui::pages;
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "awsx2", about = "AWS management CLI/TUI", version)]
+#[command(
+    name = "awsx2",
+    about = "AWS management CLI/TUI",
+    version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("BUILD_DATE"))
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Cmd>,
