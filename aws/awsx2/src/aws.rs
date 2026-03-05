@@ -676,6 +676,30 @@ fn common_tag_prefix(tags: &[&str]) -> String {
     }
 }
 
+/// Strip the trailing `-<commit>` or `-latest` suffix from a tag to get its
+/// base prefix.  E.g. `"forecast-3.0-01d4e46"` → `"forecast-3.0"`.
+/// A commit suffix is 7 lowercase hex characters.
+fn tag_base_prefix(tag: &str) -> &str {
+    if let Some(pos) = tag.rfind('-') {
+        let suffix = &tag[pos + 1..];
+        let is_commit = suffix.len() == 7 && suffix.bytes().all(|b| b.is_ascii_hexdigit());
+        if is_commit || suffix == "latest" {
+            return &tag[..pos];
+        }
+    }
+    tag
+}
+
+/// Keep only the newest image per tag base-prefix.
+/// Input must already be sorted newest-first (as returned by `list_ecr_images`).
+pub fn filter_latest_images(images: Vec<EcrImage>) -> Vec<EcrImage> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    images
+        .into_iter()
+        .filter(|img| seen.insert(tag_base_prefix(&img.tag).to_string()))
+        .collect()
+}
+
 /// List all images in an ECR repository, sorted newest-first.
 pub fn list_ecr_images(
     repository: &str,

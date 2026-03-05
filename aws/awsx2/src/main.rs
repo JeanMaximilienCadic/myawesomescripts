@@ -128,6 +128,9 @@ enum Cmd {
         /// AWS region (overrides profile/env default)
         #[arg(long, short = 'r')]
         region: Option<String>,
+        /// Show only the newest image per tag prefix (filter out older builds)
+        #[arg(long)]
+        latest: bool,
     },
     /// Print the raw AWS CLI commands used behind the scenes
     Cheatcodes,
@@ -372,8 +375,9 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             }
         }
 
-        Cmd::EcrImages { repository, region } => {
+        Cmd::EcrImages { repository, region, latest } => {
             let images = aws::list_ecr_images(&repository, region.as_deref(), None)?;
+            let images = if latest { aws::filter_latest_images(images) } else { images };
             println!(
                 "{:<70} {:<25} {:<14} {:<20} {}",
                 "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
