@@ -27,6 +27,22 @@ awsx2 list     # CLI mode — list all instances
 
 ## Installation
 
+**One-liner** (downloads pre-built binary from GitHub Releases):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/JeanMaximilienCadic/myawesomescripts/master/aws/awsx2/install.sh | bash
+```
+
+Detects your OS and architecture automatically. Installs to `/usr/local/bin` (override with `INSTALL_DIR`).
+
+**From crates.io:**
+
+```bash
+cargo install awsx2
+```
+
+**From source:**
+
 ```bash
 cargo build --release
 cp target/release/awsx2 /usr/local/bin/
