@@ -661,7 +661,7 @@ fn parse_iso8601_to_unix(s: &str) -> Option<f64> {
 /// E.g. `["v5.4.0-production-3cac2d2", "v5.4.0-production-latest"]` → `"v5.4.0-production"`.
 fn common_tag_prefix(tags: &[&str]) -> String {
     match tags {
-        [] => "<none>".to_string(),
+        [] => String::new(),
         [single] => single.to_string(),
         [first, rest @ ..] => {
             let mut prefix_len = first.len();

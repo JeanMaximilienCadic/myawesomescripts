@@ -25,6 +25,47 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::tui::app::{App, ConfirmTag, InputTag, Popup, Tab};
 use crate::tui::pages;
 
+// ── CLI spinner ───────────────────────────────────────────────────────────────
+
+struct Spinner {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    msg:  std::sync::Arc<std::sync::Mutex<String>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn new(initial: &str) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let msg  = std::sync::Arc::new(std::sync::Mutex::new(initial.to_string()));
+        let stop_c = stop.clone();
+        let msg_c  = msg.clone();
+        let handle = std::thread::spawn(move || {
+            let frames = ['⠋','⠙','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
+            let mut i = 0usize;
+            while !stop_c.load(std::sync::atomic::Ordering::Relaxed) {
+                let m = msg_c.lock().unwrap().clone();
+                print!("\r{} {}", frames[i % frames.len()], m);
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                i += 1;
+            }
+            let m = msg_c.lock().unwrap().clone();
+            print!("\r{}\r", " ".repeat(m.len() + 4));
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        });
+        Self { stop, msg, handle: Some(handle) }
+    }
+
+    fn set(&self, new_msg: &str) {
+        *self.msg.lock().unwrap() = new_msg.to_string();
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() { let _ = h.join(); }
+    }
+}
+
 // ── CLI definition ────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
@@ -376,21 +417,19 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
         }
 
         Cmd::EcrImages { repository, region, latest } => {
+            let spinner = Spinner::new("Fetching repositories...");
             let repos = match repository {
                 Some(r) => vec![r],
-                None => {
-                    print!("Fetching repositories...");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    let repos = aws::list_ecr_repositories(region.as_deref(), None)?;
-                    print!("\r{}\r", " ".repeat(40));
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    repos
-                }
+                None => aws::list_ecr_repositories(region.as_deref(), None)?,
             };
-            let mut images: Vec<aws::EcrImage> = repos
-                .iter()
-                .flat_map(|r| aws::list_ecr_images(r, region.as_deref(), None).unwrap_or_default())
-                .collect();
+            let total = repos.len();
+            let mut images: Vec<aws::EcrImage> = Vec::new();
+            for (i, r) in repos.iter().enumerate() {
+                spinner.set(&format!("Fetching images ({}/{}) — {}...", i + 1, total, r));
+                let mut batch = aws::list_ecr_images(r, region.as_deref(), None).unwrap_or_default();
+                images.append(&mut batch);
+            }
+            spinner.stop();
             // Sort: repository alphabetically, then newest-first, then tag alphabetically
             images.sort_by(|a, b| {
                 a.repository.cmp(&b.repository)
