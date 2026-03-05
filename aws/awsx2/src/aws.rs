@@ -677,9 +677,18 @@ fn common_tag_prefix(tags: &[&str]) -> String {
 }
 
 /// Strip the trailing `-<commit>` or `-latest` suffix from a tag to get its
-/// base prefix.  E.g. `"forecast-3.0-01d4e46"` → `"forecast-3.0"`.
-/// A commit suffix is 7 lowercase hex characters.
+/// base prefix.  Returns `""` when the whole tag is a bare commit hash so
+/// that pure-hash images collapse to one entry per repository (newest wins).
+///
+/// Examples:
+///   `"forecast-3.0-01d4e46"` → `"forecast-3.0"`
+///   `"v5.4.0-production-latest"` → `"v5.4.0-production"`
+///   `"84918de"` → `""` (bare commit — group by repo)
 fn tag_base_prefix(tag: &str) -> &str {
+    // Whole tag is a bare 7-hex commit hash → no meaningful prefix
+    if tag.len() == 7 && tag.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return "";
+    }
     if let Some(pos) = tag.rfind('-') {
         let suffix = &tag[pos + 1..];
         let is_commit = suffix.len() == 7 && suffix.bytes().all(|b| b.is_ascii_hexdigit());
