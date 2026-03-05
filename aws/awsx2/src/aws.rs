@@ -700,6 +700,23 @@ pub fn filter_latest_images(images: Vec<EcrImage>) -> Vec<EcrImage> {
         .collect()
 }
 
+/// List all ECR repository names in the account/region.
+pub fn list_ecr_repositories(region: Option<&str>, profile: Option<&str>) -> Result<Vec<String>> {
+    let mut args = vec!["ecr", "describe-repositories"];
+    if let Some(r) = region {
+        args.extend_from_slice(&["--region", r]);
+    }
+    let json = run_aws(&args, profile)?;
+    let val: serde_json::Value = serde_json::from_str(&json)?;
+    let empty = Vec::new();
+    Ok(val["repositories"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|r| r["repositoryName"].as_str().map(|s| s.to_string()))
+        .collect())
+}
+
 /// List all images in an ECR repository, sorted newest-first.
 pub fn list_ecr_images(
     repository: &str,

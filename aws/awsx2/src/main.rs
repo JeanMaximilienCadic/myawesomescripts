@@ -121,10 +121,10 @@ enum Cmd {
     TunnelTest {
         local_port: u16,
     },
-    /// List ECR images for a repository (like `docker images`)
+    /// List ECR images (like `docker images`). Omit repository to scan all repos.
     EcrImages {
-        /// ECR repository name
-        repository: String,
+        /// ECR repository name (omit to list all repositories)
+        repository: Option<String>,
         /// AWS region (overrides profile/env default)
         #[arg(long, short = 'r')]
         region: Option<String>,
@@ -376,7 +376,22 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
         }
 
         Cmd::EcrImages { repository, region, latest } => {
-            let images = aws::list_ecr_images(&repository, region.as_deref(), None)?;
+            let repos = match repository {
+                Some(r) => vec![r],
+                None => {
+                    print!("Fetching repositories...");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let repos = aws::list_ecr_repositories(region.as_deref(), None)?;
+                    print!("\r{}\r", " ".repeat(40));
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    repos
+                }
+            };
+            let mut images: Vec<aws::EcrImage> = repos
+                .iter()
+                .flat_map(|r| aws::list_ecr_images(r, region.as_deref(), None).unwrap_or_default())
+                .collect();
+            images.sort_by(|a, b| b.pushed_at.partial_cmp(&a.pushed_at).unwrap_or(std::cmp::Ordering::Equal));
             let images = if latest { aws::filter_latest_images(images) } else { images };
             println!(
                 "{:<70} {:<25} {:<14} {:<20} {}",
@@ -391,7 +406,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 );
             }
             if images.is_empty() {
-                println!("No images found in repository '{}'.", repository);
+                println!("No images found.");
             }
         }
 
