@@ -555,6 +555,171 @@ pub fn probe_ports_via_bastion(
     Err(AppError::AwsCli("Port probe timed out after 23 s".to_string()))
 }
 
+// ── ECR ───────────────────────────────────────────────────────────────────────
+
+/// A single ECR image entry (mirrors a `docker images` row).
+pub struct EcrImage {
+    pub repository: String,
+    /// First tag, or `<none>` for untagged images.
+    pub tag: String,
+    /// Short image digest (first 12 hex chars after `sha256:`).
+    pub image_id: String,
+    /// Unix timestamp (seconds) when the image was pushed.
+    pub pushed_at: f64,
+    pub size_bytes: u64,
+}
+
+impl EcrImage {
+    /// Human-readable size: bytes → "1.23 GB" / "456 MB" / "789 KB".
+    pub fn human_size(&self) -> String {
+        let b = self.size_bytes as f64;
+        if b >= 1_073_741_824.0 {
+            format!("{:.2} GB", b / 1_073_741_824.0)
+        } else if b >= 1_048_576.0 {
+            format!("{:.0} MB", b / 1_048_576.0)
+        } else {
+            format!("{:.0} KB", b / 1_024.0)
+        }
+    }
+
+    /// Relative time string like "3 weeks ago".
+    pub fn relative_pushed_at(&self) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(self.pushed_at);
+        let secs = (now - self.pushed_at).max(0.0) as u64;
+        if secs < 60 {
+            "just now".to_string()
+        } else if secs < 3_600 {
+            let m = secs / 60;
+            format!("{} minute{} ago", m, if m == 1 { "" } else { "s" })
+        } else if secs < 86_400 {
+            let h = secs / 3_600;
+            format!("{} hour{} ago", h, if h == 1 { "" } else { "s" })
+        } else if secs < 604_800 {
+            let d = secs / 86_400;
+            format!("{} day{} ago", d, if d == 1 { "" } else { "s" })
+        } else if secs < 2_592_000 {
+            let w = secs / 604_800;
+            format!("{} week{} ago", w, if w == 1 { "" } else { "s" })
+        } else if secs < 31_536_000 {
+            let mo = secs / 2_592_000;
+            format!("{} month{} ago", mo, if mo == 1 { "" } else { "s" })
+        } else {
+            let y = secs / 31_536_000;
+            format!("{} year{} ago", y, if y == 1 { "" } else { "s" })
+        }
+    }
+}
+
+/// Parse an ISO 8601 datetime string (e.g. `"2024-01-15T10:30:00+00:00"`) to a
+/// Unix timestamp in seconds.  No external crates required.
+fn parse_iso8601_to_unix(s: &str) -> Option<f64> {
+    if s.len() < 19 { return None; }
+    let year:  i64 = s[0..4].parse().ok()?;
+    let month: i64 = s[5..7].parse().ok()?;
+    let day:   i64 = s[8..10].parse().ok()?;
+    let hour:  i64 = s[11..13].parse().ok()?;
+    let min:   i64 = s[14..16].parse().ok()?;
+    let sec:   i64 = s[17..19].parse().ok()?;
+
+    // Skip optional fractional seconds, then read timezone
+    let rest = &s[19..];
+    let tz_rest = if rest.starts_with('.') {
+        let end = rest.find(|c: char| c == '+' || c == '-' || c == 'Z').unwrap_or(rest.len());
+        &rest[end..]
+    } else {
+        rest
+    };
+    let tz_offset_secs: i64 = if tz_rest.is_empty() || tz_rest.starts_with('Z') {
+        0
+    } else {
+        let sign: i64 = if tz_rest.starts_with('-') { -1 } else { 1 };
+        let parts: Vec<&str> = tz_rest[1..].split(':').collect();
+        let tz_h: i64 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let tz_m: i64 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        sign * (tz_h * 3_600 + tz_m * 60)
+    };
+
+    fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
+    fn days_in_month(y: i64, m: i64) -> i64 {
+        match m { 1|3|5|7|8|10|12 => 31, 4|6|9|11 => 30, 2 => if is_leap(y) { 29 } else { 28 }, _ => 0 }
+    }
+    fn days_before_year(y: i64) -> i64 { let y = y - 1; y*365 + y/4 - y/100 + y/400 }
+
+    let epoch = days_before_year(1970);
+    let mut days = days_before_year(year);
+    for m in 1..month { days += days_in_month(year, m); }
+    days += day - 1;
+
+    Some(((days - epoch) * 86_400 + hour * 3_600 + min * 60 + sec - tz_offset_secs) as f64)
+}
+
+/// Given multiple tags for the same image, return their longest common prefix
+/// with trailing separators (`-`, `_`, `.`) stripped.
+/// E.g. `["v5.4.0-production-3cac2d2", "v5.4.0-production-latest"]` → `"v5.4.0-production"`.
+fn common_tag_prefix(tags: &[&str]) -> String {
+    match tags {
+        [] => "<none>".to_string(),
+        [single] => single.to_string(),
+        [first, rest @ ..] => {
+            let mut prefix_len = first.len();
+            for tag in rest {
+                let common = first.chars().zip(tag.chars()).take_while(|(a, b)| a == b).count();
+                prefix_len = prefix_len.min(common);
+            }
+            first[..prefix_len]
+                .trim_end_matches(|c| c == '-' || c == '_' || c == '.')
+                .to_string()
+        }
+    }
+}
+
+/// List all images in an ECR repository, sorted newest-first.
+pub fn list_ecr_images(
+    repository: &str,
+    region: Option<&str>,
+    profile: Option<&str>,
+) -> Result<Vec<EcrImage>> {
+    let mut args = vec!["ecr", "describe-images", "--repository-name", repository];
+    if let Some(r) = region {
+        args.extend_from_slice(&["--region", r]);
+    }
+    let json = run_aws(&args, profile)?;
+    let val: serde_json::Value = serde_json::from_str(&json)?;
+    let empty = Vec::new();
+    let details = val["imageDetails"].as_array().unwrap_or(&empty);
+
+    let mut images: Vec<EcrImage> = details
+        .iter()
+        .map(|d| {
+            let raw_tags: Vec<&str> = d["imageTags"]
+                .as_array()
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let tag = common_tag_prefix(&raw_tags);
+            let digest = d["imageDigest"].as_str().unwrap_or("");
+            let image_id = digest
+                .strip_prefix("sha256:")
+                .unwrap_or(digest)
+                .chars()
+                .take(12)
+                .collect();
+            // imagePushedAt may be a float (some CLI versions) or an ISO 8601 string
+            let pushed_at = d["imagePushedAt"]
+                .as_f64()
+                .or_else(|| d["imagePushedAt"].as_str().and_then(parse_iso8601_to_unix))
+                .unwrap_or(0.0);
+            let size_bytes = d["imageSizeInBytes"].as_u64().unwrap_or(0);
+            EcrImage { repository: repository.to_string(), tag, image_id, pushed_at, size_bytes }
+        })
+        .collect();
+
+    images.sort_by(|a, b| b.pushed_at.partial_cmp(&a.pushed_at).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(images)
+}
+
 /// Human-readable DNS → EC2 resolution report.
 pub fn resolve_dns_report(input: &str, profile: Option<&str>) -> Result<String> {
     use std::fmt::Write as _;

@@ -121,6 +121,14 @@ enum Cmd {
     TunnelTest {
         local_port: u16,
     },
+    /// List ECR images for a repository (like `docker images`)
+    EcrImages {
+        /// ECR repository name
+        repository: String,
+        /// AWS region (overrides profile/env default)
+        #[arg(long, short = 'r')]
+        region: Option<String>,
+    },
     /// AWS Client VPN management (SAML authentication)
     Vpn {
         #[command(subcommand)]
@@ -359,6 +367,25 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             } else {
                 eprintln!("Port {} is CLOSED.", local_port);
                 std::process::exit(1);
+            }
+        }
+
+        Cmd::EcrImages { repository, region } => {
+            let images = aws::list_ecr_images(&repository, region.as_deref(), None)?;
+            println!(
+                "{:<40} {:<25} {:<14} {:<20} {}",
+                "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
+            );
+            println!("{}", "-".repeat(110));
+            for img in &images {
+                println!(
+                    "{:<40} {:<25} {:<14} {:<20} {}",
+                    img.repository, img.tag, img.image_id,
+                    img.relative_pushed_at(), img.human_size()
+                );
+            }
+            if images.is_empty() {
+                println!("No images found in repository '{}'.", repository);
             }
         }
 
