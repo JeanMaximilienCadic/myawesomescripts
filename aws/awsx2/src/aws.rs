@@ -691,6 +691,20 @@ pub fn list_ecr_images(
     let empty = Vec::new();
     let details = val["imageDetails"].as_array().unwrap_or(&empty);
 
+    // Build full ECR URI: {accountId}.dkr.ecr.{region}.amazonaws.com/{repo}
+    let effective_region = region
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| get_region(profile));
+    let registry_id = details
+        .first()
+        .and_then(|d| d["registryId"].as_str())
+        .unwrap_or("");
+    let full_repository = if registry_id.is_empty() {
+        repository.to_string()
+    } else {
+        format!("{}.dkr.ecr.{}.amazonaws.com/{}", registry_id, effective_region, repository)
+    };
+
     let mut images: Vec<EcrImage> = details
         .iter()
         .map(|d| {
@@ -712,7 +726,7 @@ pub fn list_ecr_images(
                 .or_else(|| d["imagePushedAt"].as_str().and_then(parse_iso8601_to_unix))
                 .unwrap_or(0.0);
             let size_bytes = d["imageSizeInBytes"].as_u64().unwrap_or(0);
-            EcrImage { repository: repository.to_string(), tag, image_id, pushed_at, size_bytes }
+            EcrImage { repository: full_repository.clone(), tag, image_id, pushed_at, size_bytes }
         })
         .collect();
 

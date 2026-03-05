@@ -373,13 +373,13 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
         Cmd::EcrImages { repository, region } => {
             let images = aws::list_ecr_images(&repository, region.as_deref(), None)?;
             println!(
-                "{:<40} {:<25} {:<14} {:<20} {}",
+                "{:<70} {:<25} {:<14} {:<20} {}",
                 "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
             );
-            println!("{}", "-".repeat(110));
+            println!("{}", "-".repeat(140));
             for img in &images {
                 println!(
-                    "{:<40} {:<25} {:<14} {:<20} {}",
+                    "{:<70} {:<25} {:<14} {:<20} {}",
                     img.repository, img.tag, img.image_id,
                     img.relative_pushed_at(), img.human_size()
                 );
