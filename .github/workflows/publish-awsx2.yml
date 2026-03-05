@@ -1,0 +1,20 @@
+name: Publish awsx2 to crates.io
+
+on:
+  workflow_run:
+    workflows: ["Release awsx2"]
+    types: [completed]
+
+jobs:
+  publish:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        working-directory: aws/awsx2
+        run: cargo publish --token "${{ secrets.CRATES_TOKEN }}"
