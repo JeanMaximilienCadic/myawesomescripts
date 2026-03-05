@@ -709,6 +709,25 @@ pub fn filter_latest_images(images: Vec<EcrImage>) -> Vec<EcrImage> {
         .collect()
 }
 
+/// Parse a full ECR image URI into `(repo_name, region)`.
+///
+/// Accepts both plain names (`my-repo`) and full URIs
+/// (`123456789012.dkr.ecr.ap-northeast-1.amazonaws.com/my-repo`).
+/// Returns the extracted region only when a full URI is provided.
+pub fn parse_ecr_uri(input: &str) -> (String, Option<String>) {
+    // Full URI pattern: <account>.dkr.ecr.<region>.amazonaws.com/<repo>
+    if let Some(after_host) = input.find(".amazonaws.com/") {
+        let repo = input[after_host + ".amazonaws.com/".len()..].to_string();
+        let host = &input[..after_host];
+        let region = host
+            .split(".dkr.ecr.")
+            .nth(1)
+            .map(|s| s.to_string());
+        return (repo, region);
+    }
+    (input.to_string(), None)
+}
+
 /// List all ECR repository names in the account/region.
 pub fn list_ecr_repositories(region: Option<&str>, profile: Option<&str>) -> Result<Vec<String>> {
     let mut args = vec!["ecr", "describe-repositories"];

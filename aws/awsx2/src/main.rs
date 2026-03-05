@@ -417,6 +417,15 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
         }
 
         Cmd::EcrImages { repository, region, latest } => {
+            // If a full ECR URI was given, extract repo name + region from it
+            let (repository, region) = match repository {
+                Some(r) => {
+                    let (repo, uri_region) = aws::parse_ecr_uri(&r);
+                    let effective_region = uri_region.or(region);
+                    (Some(repo), effective_region)
+                }
+                None => (None, region),
+            };
             let spinner = Spinner::new("Fetching repositories...");
             let repos = match repository {
                 Some(r) => vec![r],
