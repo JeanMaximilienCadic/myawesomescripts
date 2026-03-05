@@ -423,12 +423,28 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 None => aws::list_ecr_repositories(region.as_deref(), None)?,
             };
             let total = repos.len();
-            let mut images: Vec<aws::EcrImage> = Vec::new();
-            for (i, r) in repos.iter().enumerate() {
-                spinner.set(&format!("Fetching images ({}/{}) — {}...", i + 1, total, r));
-                let mut batch = aws::list_ecr_images(r, region.as_deref(), None).unwrap_or_default();
-                images.append(&mut batch);
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let handles: Vec<_> = repos.iter().map(|r| {
+                let r = r.clone();
+                let region = region.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    let result = aws::list_ecr_images(&r, region.as_deref(), None).unwrap_or_default();
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    result
+                })
+            }).collect();
+            while done.load(std::sync::atomic::Ordering::Relaxed) < total {
+                spinner.set(&format!(
+                    "Fetching images ({}/{})...",
+                    done.load(std::sync::atomic::Ordering::Relaxed), total
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
+            let mut images: Vec<aws::EcrImage> = handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap_or_default())
+                .collect();
             spinner.stop();
             // Sort: repository alphabetically, then newest-first, then tag alphabetically
             images.sort_by(|a, b| {
