@@ -129,6 +129,8 @@ enum Cmd {
         #[arg(long, short = 'r')]
         region: Option<String>,
     },
+    /// Print the raw AWS CLI commands used behind the scenes
+    Cheatcodes,
     /// AWS Client VPN management (SAML authentication)
     Vpn {
         #[command(subcommand)]
@@ -389,6 +391,10 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             }
         }
 
+        Cmd::Cheatcodes => {
+            print_cheatcodes();
+        }
+
         Cmd::Vpn { action } => {
             match action {
                 VpnAction::Setup(args) => {
@@ -509,6 +515,77 @@ fn try_alb_tunnel(
         return Ok(Some(tp));
     }
     Ok(None)
+}
+
+// ── Cheatcodes ────────────────────────────────────────────────────────────────
+
+fn print_cheatcodes() {
+    let sections: &[(&str, &[(&str, &str)])] = &[
+        ("EC2 Instances", &[
+            ("List all instances + state",
+             "aws ec2 describe-instances --query 'Reservations[*].Instances[*]' --output json"),
+            ("Start an instance",
+             "aws ec2 start-instances --instance-ids <id>"),
+            ("Stop an instance",
+             "aws ec2 stop-instances --instance-ids <id>"),
+            ("Force-stop an instance",
+             "aws ec2 stop-instances --instance-ids <id> --force"),
+            ("Change instance type",
+             "aws ec2 modify-instance-attribute --instance-id <id> --instance-type <type>"),
+        ]),
+        ("SSM / Tunnels", &[
+            ("List SSM-online instances",
+             "aws ssm describe-instance-information --output json"),
+            ("Direct port-forward tunnel",
+             "aws ssm start-session --target <id> --document-name AWS-StartPortForwardingSession \\\n  --parameters '{\"portNumber\":[\"8000\"],\"localPortNumber\":[\"8080\"]}'"),
+            ("Tunnel via bastion to remote host",
+             "aws ssm start-session --target <bastion-id> --document-name AWS-StartPortForwardingSessionToRemoteHost \\\n  --parameters '{\"host\":[\"10.0.1.42\"],\"portNumber\":[\"8000\"],\"localPortNumber\":[\"8080\"]}'"),
+            ("Run a shell command on an instance",
+             "aws ssm send-command --instance-ids <id> --document-name AWS-RunShellScript \\\n  --parameters 'commands=[\"dig +short <host>\"]'"),
+            ("Poll command result",
+             "aws ssm get-command-invocation --command-id <cmd-id> --instance-id <id>"),
+        ]),
+        ("ALB / Load Balancers", &[
+            ("List all ALBs",
+             "aws elbv2 describe-load-balancers --output json"),
+            ("List target groups for an ALB",
+             "aws elbv2 describe-target-groups --load-balancer-arn <arn>"),
+            ("Get healthy targets",
+             "aws elbv2 describe-target-health --target-group-arn <arn>"),
+        ]),
+        ("Security Groups / ENIs", &[
+            ("Find ENI by private IP",
+             "aws ec2 describe-network-interfaces \\\n  --filters Name=addresses.private-ip-address,Values=<ip>"),
+            ("Inspect security group rules",
+             "aws ec2 describe-security-groups --group-ids <sg-id>"),
+        ]),
+        ("ECR", &[
+            ("List images in a repository",
+             "aws ecr describe-images --repository-name <repo> [--region <region>] --output json"),
+            ("List all repositories",
+             "aws ecr describe-repositories --output json"),
+        ]),
+        ("Auth / Identity", &[
+            ("SSO login",
+             "aws sso login [--profile <profile>]"),
+            ("Check current identity",
+             "aws sts get-caller-identity"),
+            ("Get configured region",
+             "aws configure get region"),
+        ]),
+    ];
+
+    println!("awsx2 cheatcodes — raw AWS CLI commands used under the hood\n");
+    for (section, entries) in sections.iter() {
+        println!("── {} {}", section, "─".repeat(60usize.saturating_sub(section.len() + 4)));
+        for (label, cmd) in entries.iter() {
+            println!("  # {}", label);
+            for line in cmd.lines() {
+                println!("  {}", line);
+            }
+            println!();
+        }
+    }
 }
 
 // ── TUI ───────────────────────────────────────────────────────────────────────
