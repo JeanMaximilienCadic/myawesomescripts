@@ -391,22 +391,27 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 .iter()
                 .flat_map(|r| aws::list_ecr_images(r, region.as_deref(), None).unwrap_or_default())
                 .collect();
-            images.sort_by(|a, b| b.pushed_at.partial_cmp(&a.pushed_at).unwrap_or(std::cmp::Ordering::Equal));
+            // Sort: repository alphabetically, then newest-first, then tag alphabetically
+            images.sort_by(|a, b| {
+                a.repository.cmp(&b.repository)
+                    .then(b.pushed_at.partial_cmp(&a.pushed_at).unwrap_or(std::cmp::Ordering::Equal))
+                    .then(a.tag.cmp(&b.tag))
+            });
             let images = if latest { aws::filter_latest_images(images) } else { images };
-            println!(
-                "{:<70} {:<25} {:<14} {:<20} {}",
-                "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
-            );
-            println!("{}", "-".repeat(140));
-            for img in &images {
-                println!(
-                    "{:<70} {:<25} {:<14} {:<20} {}",
-                    img.repository, img.tag, img.image_id,
-                    img.relative_pushed_at(), img.human_size()
-                );
-            }
             if images.is_empty() {
                 println!("No images found.");
+            } else {
+                let repo_w = images.iter().map(|i| i.repository.len()).max().unwrap_or(10).max(10) + 2;
+                let tag_w  = images.iter().map(|i| i.tag.len()).max().unwrap_or(3).max(3) + 2;
+                println!("{:<repo_w$} {:<tag_w$} {:<14} {:<20} {}", "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE");
+                println!("{}", "-".repeat(repo_w + tag_w + 14 + 20 + 10));
+                for img in &images {
+                    println!(
+                        "{:<repo_w$} {:<tag_w$} {:<14} {:<20} {}",
+                        img.repository, img.tag, img.image_id,
+                        img.relative_pushed_at(), img.human_size()
+                    );
+                }
             }
         }
 

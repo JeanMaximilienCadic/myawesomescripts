@@ -696,7 +696,7 @@ pub fn filter_latest_images(images: Vec<EcrImage>) -> Vec<EcrImage> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     images
         .into_iter()
-        .filter(|img| seen.insert(tag_base_prefix(&img.tag).to_string()))
+        .filter(|img| seen.insert(format!("{}:{}", img.repository, tag_base_prefix(&img.tag))))
         .collect()
 }
 
