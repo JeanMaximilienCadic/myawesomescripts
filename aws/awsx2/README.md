@@ -112,6 +112,40 @@ awsx2 tunnel-test 8080    # Check if port is open
 awsx2 tunnel-stop         # Kill all SSM tunnels + clean up proxies
 ```
 
+### SSH via SSM
+
+Seamless SSH to EC2 instances using SSM as transport — no bastion hosts, no public IPs, no key management.
+
+**Generate `~/.ssh/config` entries** for all running, SSM-online instances:
+
+```bash
+awsx2 ssh-config              # Update ~/.ssh/config
+awsx2 ssh-config --dry-run    # Preview without writing
+awsx2 ssh-config --user ubuntu # Override SSH user (default: ec2-user)
+```
+
+This creates a managed block in `~/.ssh/config` with entries like:
+
+```
+# BEGIN awsx2-managed
+Host dev-risk-model-ec2
+    User ec2-user
+    ProxyCommand awsx2 ssm-proxy --name dev-risk-model-ec2 --port %p --region ap-northeast-1
+# END awsx2-managed
+```
+
+Running `ssh-config` again replaces the managed block and removes any stale duplicate Host entries outside it.
+
+**Then just SSH normally:**
+
+```bash
+ssh dev-risk-model-ec2
+```
+
+On first connection, `ssm-proxy` automatically pushes your SSH public key to the instance via SSM send-command (cached for 7 days). Subsequent connections skip this step.
+
+The `ssm-proxy` subcommand resolves the EC2 Name tag to an instance ID dynamically, so instance replacements (e.g. ASG rotations) are handled transparently.
+
 ### VPN
 
 Connect to AWS Client VPN endpoints that use SAML/SSO authentication. Credentials are saved locally so you only need to enter the MFA code each time.
@@ -295,6 +329,7 @@ awsx2
 | `url` | URL parsing for SAML form data extraction |
 | `dirs` | Platform-correct config directory (`~/.config/awsx2/`) |
 | `tempfile` | Secure temporary files for OpenVPN configs and credentials |
+| `exec` | Unix exec replacement for SSM proxy (replaces process without forking) |
 
 ## Environment Variables
 

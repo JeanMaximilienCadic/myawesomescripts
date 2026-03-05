@@ -173,6 +173,27 @@ enum Cmd {
         #[arg(long)]
         latest: bool,
     },
+    /// Act as SSH ProxyCommand: resolve EC2 Name tag to instance ID and exec SSM session
+    SsmProxy {
+        /// EC2 Name tag to resolve
+        #[arg(long)]
+        name: String,
+        /// SSH port (passed by SSH as %p)
+        #[arg(long, default_value = "22")]
+        port: String,
+        /// AWS region (defaults to configured region)
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// Generate ~/.ssh/config entries for all running EC2 instances (SSM-online)
+    SshConfig {
+        /// Only print, don't write to ~/.ssh/config
+        #[arg(long)]
+        dry_run: bool,
+        /// SSH user (default: ec2-user)
+        #[arg(long, default_value = "ec2-user")]
+        user: String,
+    },
     /// Print the raw AWS CLI commands used behind the scenes
     Cheatcodes,
     /// AWS Client VPN management (SAML authentication)
@@ -479,6 +500,14 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             }
         }
 
+        Cmd::SsmProxy { name, port, region } => {
+            run_ssm_proxy(&name, &port, region.as_deref())?;
+        }
+
+        Cmd::SshConfig { dry_run, user } => {
+            run_ssh_config(dry_run, &user)?;
+        }
+
         Cmd::Cheatcodes => {
             print_cheatcodes();
         }
@@ -603,6 +632,255 @@ fn try_alb_tunnel(
         return Ok(Some(tp));
     }
     Ok(None)
+}
+
+// ── SSM Proxy (SSH ProxyCommand) ──────────────────────────────────────────
+
+fn run_ssm_proxy(name: &str, port: &str, region: Option<&str>) -> error::Result<()> {
+    let region = region
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| aws::get_region(None));
+
+    // Resolve Name tag → instance ID
+    let inst = aws::find_instance_by_name(name, None)?;
+
+    // Ensure SSH public key is on the instance (cached, only runs once per instance)
+    ensure_ssh_key_pushed(&inst.id, &region);
+
+    // exec aws ssm start-session (replaces current process)
+    let err = exec::execvp(
+        "aws",
+        &[
+            "aws", "ssm", "start-session",
+            "--target", &inst.id,
+            "--document-name", "AWS-StartSSHSession",
+            "--parameters", &format!("portNumber={}", port),
+            "--region", &region,
+        ],
+    );
+    Err(error::AppError::AwsCli(format!("exec failed: {}", err)))
+}
+
+/// Push the user's SSH public key to the instance via SSM send-command,
+/// but only once per instance (cached in ~/.cache/awsx2/ssh-keys/).
+fn ensure_ssh_key_pushed(instance_id: &str, region: &str) {
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("awsx2")
+        .join("ssh-keys");
+    let marker = cache_dir.join(instance_id);
+
+    // If marker exists and is less than 7 days old, skip
+    if let Ok(meta) = std::fs::metadata(&marker) {
+        if let Some(age) = meta.modified().ok().and_then(|m| m.elapsed().ok()) {
+            if age < std::time::Duration::from_secs(7 * 86_400) {
+                return;
+            }
+        }
+    }
+
+    // Find the user's public key
+    let home = std::env::var("HOME").unwrap_or_default();
+    let pub_key = ["id_ed25519.pub", "id_rsa.pub", "id_ecdsa.pub"]
+        .iter()
+        .map(|f| std::path::PathBuf::from(&home).join(".ssh").join(f))
+        .find(|p| p.exists());
+    let pub_key_path = match pub_key {
+        Some(p) => p,
+        None => return, // no public key found, nothing to push
+    };
+    let pub_key_content = match std::fs::read_to_string(&pub_key_path) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return,
+    };
+
+    // Push key idempotently: grep to avoid duplicates
+    let script = format!(
+        "grep -qF '{}' /home/ec2-user/.ssh/authorized_keys 2>/dev/null || echo '{}' >> /home/ec2-user/.ssh/authorized_keys",
+        pub_key_content, pub_key_content
+    );
+
+    let output = std::process::Command::new("aws")
+        .args([
+            "ssm", "send-command",
+            "--instance-ids", instance_id,
+            "--document-name", "AWS-RunShellScript",
+            "--parameters", &format!("commands=[\"{}\"]", script.replace('"', "\\\"")),
+            "--region", region,
+            "--output", "json",
+        ])
+        .output();
+
+    let command_id = match output {
+        Ok(o) if o.status.success() => {
+            let json: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+            json["Command"]["CommandId"].as_str().unwrap_or("").to_string()
+        }
+        _ => return,
+    };
+
+    if command_id.is_empty() { return; }
+
+    // Wait for completion (up to 10s)
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let poll = std::process::Command::new("aws")
+            .args([
+                "ssm", "get-command-invocation",
+                "--command-id", &command_id,
+                "--instance-id", instance_id,
+                "--region", region,
+                "--output", "json",
+            ])
+            .output();
+        if let Ok(o) = poll {
+            if o.status.success() {
+                let json: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap_or_default();
+                let status = json["Status"].as_str().unwrap_or("");
+                if status == "Success" {
+                    let _ = std::fs::create_dir_all(&cache_dir);
+                    let _ = std::fs::write(&marker, "");
+                    return;
+                }
+                if status == "Failed" || status == "Cancelled" {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// ── SSH Config generation ────────────────────────────────────────────────
+
+const SSH_CONFIG_BEGIN: &str = "# BEGIN awsx2-managed";
+const SSH_CONFIG_END: &str = "# END awsx2-managed";
+
+fn run_ssh_config(dry_run: bool, user: &str) -> error::Result<()> {
+    let instances = aws::list_instances(None)?;
+    let running_ssm: Vec<_> = instances
+        .into_iter()
+        .filter(|i| {
+            i.state == models::InstanceState::Running
+                && i.ssm_status == models::SsmStatus::Online
+                && !i.name.is_empty()
+        })
+        .collect();
+
+    if running_ssm.is_empty() {
+        println!("No running SSM-online instances found.");
+        return Ok(());
+    }
+
+    // Find awsx2 binary path for ProxyCommand
+    let awsx2_bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "awsx2".to_string());
+
+    let region = aws::get_region(None);
+
+    // Collect instance names we'll manage
+    let managed_names: std::collections::HashSet<String> = running_ssm
+        .iter()
+        .map(|i| i.name.clone())
+        .collect();
+
+    let mut block = String::new();
+    block.push_str(&format!("{}\n", SSH_CONFIG_BEGIN));
+    for inst in &running_ssm {
+        block.push_str(&format!(
+            "\nHost {name}\n    User {user}\n    ProxyCommand {bin} ssm-proxy --name {name} --port %p --region {region}\n",
+            name = inst.name,
+            user = user,
+            bin = awsx2_bin,
+            region = region,
+        ));
+    }
+    block.push_str(&format!("{}\n", SSH_CONFIG_END));
+
+    if dry_run {
+        println!("{}", block);
+        println!("# {} instances (dry-run, not written)", running_ssm.len());
+        return Ok(());
+    }
+
+    // Read existing config
+    let home = std::env::var("HOME").unwrap_or_default();
+    let ssh_dir = std::path::PathBuf::from(&home).join(".ssh");
+    let config_path = ssh_dir.join("config");
+    let _ = std::fs::create_dir_all(&ssh_dir);
+    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+
+    // Step 1: Remove the old awsx2-managed block if present
+    let cleaned = if let (Some(begin), Some(end)) = (
+        existing.find(SSH_CONFIG_BEGIN),
+        existing.find(SSH_CONFIG_END),
+    ) {
+        let end_line = existing[end..].find('\n').map(|i| end + i + 1).unwrap_or(existing.len());
+        format!("{}{}", &existing[..begin], &existing[end_line..])
+    } else {
+        existing.clone()
+    };
+
+    // Step 2: Remove stale Host blocks outside the managed section that
+    // duplicate instances we're about to add (matching by Host name).
+    let cleaned = remove_stale_host_blocks(&cleaned, &managed_names);
+
+    // Step 3: Append the new managed block
+    let new_config = if cleaned.is_empty() || cleaned.ends_with('\n') {
+        format!("{}{}", cleaned, block)
+    } else {
+        format!("{}\n\n{}", cleaned, block)
+    };
+
+    std::fs::write(&config_path, &new_config)?;
+    println!("Updated {} with {} instances.", config_path.display(), running_ssm.len());
+    for inst in &running_ssm {
+        println!("  ssh {}", inst.name);
+    }
+    Ok(())
+}
+
+/// Remove SSH config Host blocks whose Host name matches any of the given names.
+/// Parses the config line-by-line: a Host block starts at `Host <name>` and ends
+/// at the next `Host ` line or EOF.
+fn remove_stale_host_blocks(config: &str, names: &std::collections::HashSet<String>) -> String {
+    let lines: Vec<&str> = config.lines().collect();
+    let mut result = Vec::new();
+    let mut skip = false;
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.starts_with("Host ") && !trimmed.starts_with("Host *") {
+            let host_name = trimmed.strip_prefix("Host ").unwrap().trim();
+            if names.contains(host_name) {
+                skip = true;
+                continue;
+            } else {
+                skip = false;
+            }
+        } else if skip {
+            // Inside a block we're removing: skip indented lines or blank lines
+            if trimmed.is_empty() || trimmed.starts_with('#') || line.starts_with(' ') || line.starts_with('\t') {
+                continue;
+            } else {
+                // Non-indented, non-empty line that isn't a Host — stop skipping
+                skip = false;
+            }
+        }
+        if !skip {
+            result.push(*line);
+        }
+    }
+
+    // Trim trailing blank lines that may be left behind
+    while result.last().map_or(false, |l| l.trim().is_empty()) {
+        result.pop();
+    }
+    if result.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", result.join("\n"))
+    }
 }
 
 // ── Cheatcodes ────────────────────────────────────────────────────────────────
