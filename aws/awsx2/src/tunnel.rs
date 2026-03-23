@@ -358,6 +358,46 @@ pub fn start_remote_tunnel_via_instance(
     })
 }
 
+// ── Bind forwarder (socat) ────────────────────────────────────────────────────
+
+/// Start a socat process to forward from bind_addr:port to 127.0.0.1:target_port.
+/// Returns the socat process PID.
+pub fn start_bind_forwarder(bind_addr: &str, listen_port: u16, target_port: u16) -> Result<u32> {
+    // Check if socat is available
+    let socat_check = Command::new("which").arg("socat").output();
+    if socat_check.is_err() || !socat_check.unwrap().status.success() {
+        return Err(AppError::Tunnel(
+            "socat not found. Install it with: brew install socat (macOS) or apt install socat (Linux)".into()
+        ));
+    }
+
+    let mut cmd = Command::new("socat");
+    cmd.args([
+        &format!("TCP-LISTEN:{},bind={},fork,reuseaddr", listen_port, bind_addr),
+        &format!("TCP:127.0.0.1:{}", target_port),
+    ]);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::null());
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    std::mem::forget(child);
+
+    // Wait briefly for socat to bind
+    std::thread::sleep(Duration::from_millis(200));
+    Ok(pid)
+}
+
+/// Find an available port in a range for internal use
+pub fn find_available_port(start: u16) -> u16 {
+    for port in start..start + 100 {
+        if !test_port(port) {
+            return port;
+        }
+    }
+    start + 100 // fallback
+}
+
 // ── Stop tunnels ──────────────────────────────────────────────────────────────
 
 pub fn stop_tunnel(pid: u32) {

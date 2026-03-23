@@ -128,6 +128,9 @@ enum Cmd {
         /// Remote port on the instance (default: 8000)
         #[arg(default_value = "8000")]
         remote_port: u16,
+        /// Bind address (default: 0.0.0.0 for Docker/external access)
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
     },
     /// Tunnel to any internal URL (smart ALB resolution + bastion fallback)
     TunnelUrl {
@@ -138,6 +141,9 @@ enum Cmd {
         /// Set up nginx reverse proxy so the URL works directly in the browser
         #[arg(long)]
         proxy: bool,
+        /// Bind address (default: 0.0.0.0 for Docker/external access)
+        #[arg(long, default_value = "0.0.0.0")]
+        bind: String,
     },
     /// Tunnel to EC2 or Fargate by resolving a URL's DNS
     TunnelDns {
@@ -350,17 +356,32 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             println!("{}", aws::resolve_dns_report(&url, None)?);
         }
 
-        Cmd::Tunnel { pattern, local_port, remote_port } => {
+        Cmd::Tunnel { pattern, local_port, remote_port, bind } => {
             if tunnel::test_port(local_port) {
                 println!("Port {} already in use (tunnel may be active).", local_port);
                 return Ok(());
             }
-            println!("Starting tunnel: *{}*:{} -> localhost:{}", pattern, remote_port, local_port);
-            let tp = tunnel::start_tunnel_by_pattern(&pattern, local_port, remote_port, None)?;
-            println!("Tunnel active: localhost:{} -> {}:{}", tp.local_port, tp.instance_name, tp.remote_port);
+
+            let needs_forwarder = bind != "127.0.0.1";
+            let ssm_port = if needs_forwarder {
+                tunnel::find_available_port(local_port + 10000)
+            } else {
+                local_port
+            };
+
+            println!("Starting tunnel: *{}*:{} -> {}:{}", pattern, remote_port, bind, local_port);
+            let tp = tunnel::start_tunnel_by_pattern(&pattern, ssm_port, remote_port, None)?;
+
+            if needs_forwarder {
+                let fwd_pid = tunnel::start_bind_forwarder(&bind, local_port, ssm_port)?;
+                println!("Tunnel active: {}:{} -> {}:{} (forwarder pid {})",
+                    bind, local_port, tp.instance_name, tp.remote_port, fwd_pid);
+            } else {
+                println!("Tunnel active: localhost:{} -> {}:{}", tp.local_port, tp.instance_name, tp.remote_port);
+            }
         }
 
-        Cmd::TunnelUrl { url, local_port, remote_port, proxy } => {
+        Cmd::TunnelUrl { url, local_port, remote_port, proxy, bind } => {
             if tunnel::test_port(local_port) {
                 println!("Port {} already in use.", local_port);
                 return Ok(());
@@ -368,26 +389,53 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             let host = aws::strip_url_to_host(&url);
             println!("Resolving {}...", host);
 
+            let needs_forwarder = bind != "127.0.0.1";
+            let ssm_port = if needs_forwarder {
+                tunnel::find_available_port(local_port + 10000)
+            } else {
+                local_port
+            };
+
             // Smart path: URL → ALB → target group → healthy backend → SG → hop instance
-            let tunneled = match try_alb_tunnel(&host, local_port, remote_port) {
+            let tunneled = match try_alb_tunnel(&host, ssm_port, remote_port) {
                 Ok(Some(tp)) => {
-                    println!(
-                        "Tunnel active: localhost:{} -> {}:{} via {}",
-                        tp.local_port,
-                        tp.remote_host.as_deref().unwrap_or("?"),
-                        tp.remote_port,
-                        tp.instance_name,
-                    );
+                    if needs_forwarder {
+                        let fwd_pid = tunnel::start_bind_forwarder(&bind, local_port, ssm_port)?;
+                        println!(
+                            "Tunnel active: {}:{} -> {}:{} via {} (forwarder pid {})",
+                            bind, local_port,
+                            tp.remote_host.as_deref().unwrap_or("?"),
+                            tp.remote_port,
+                            tp.instance_name,
+                            fwd_pid,
+                        );
+                    } else {
+                        println!(
+                            "Tunnel active: localhost:{} -> {}:{} via {}",
+                            tp.local_port,
+                            tp.remote_host.as_deref().unwrap_or("?"),
+                            tp.remote_port,
+                            tp.instance_name,
+                        );
+                    }
                     true
                 }
                 _ => {
                     // Fallback: try all SSM-online bastions directly
                     println!("  Trying bastions...");
-                    let tp = tunnel::start_url_tunnel_via_any_bastion(&url, local_port, remote_port, None)?;
-                    println!(
-                        "Tunnel active: localhost:{} -> {} via {}",
-                        tp.local_port, tp.remote_host.as_deref().unwrap_or("?"), tp.instance_name
-                    );
+                    let tp = tunnel::start_url_tunnel_via_any_bastion(&url, ssm_port, remote_port, None)?;
+                    if needs_forwarder {
+                        let fwd_pid = tunnel::start_bind_forwarder(&bind, local_port, ssm_port)?;
+                        println!(
+                            "Tunnel active: {}:{} -> {} via {} (forwarder pid {})",
+                            bind, local_port, tp.remote_host.as_deref().unwrap_or("?"), tp.instance_name, fwd_pid
+                        );
+                    } else {
+                        println!(
+                            "Tunnel active: localhost:{} -> {} via {}",
+                            tp.local_port, tp.remote_host.as_deref().unwrap_or("?"), tp.instance_name
+                        );
+                    }
                     true
                 }
             };
