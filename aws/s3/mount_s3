@@ -46,7 +46,8 @@ mount_bucket() {
         --s3-force-path-style \
         --s3-upload-concurrency 4 \
         --s3-chunk-size 64M \
-        --no-modtime \
+        --use-server-modtime \
+        --default-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         --log-file "$LOG_FILE" \
         --log-level INFO \
         --daemon \
