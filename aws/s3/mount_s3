@@ -32,14 +32,25 @@ mount_bucket() {
 
     # 4. Execute rclone
     rclone mount "$REMOTE" "$MOUNT_POINT" \
-        --vfs-cache-mode writes \
-        --vfs-read-chunk-size 128M \
+        --vfs-cache-mode full \
+        --vfs-read-chunk-size 64M \
+        --vfs-read-chunk-size-limit 512M \
+        --vfs-read-ahead 256M \
+        --vfs-cache-max-size 4G \
+        --vfs-cache-max-age 1h \
+        --vfs-fast-fingerprint \
+        --buffer-size 64M \
+        --transfers 8 \
+        --checkers 8 \
         --s3-provider Other \
         --s3-force-path-style \
+        --s3-upload-concurrency 4 \
+        --s3-chunk-size 64M \
         --no-modtime \
         --log-file "$LOG_FILE" \
-        --log-level DEBUG \
-        --daemon
+        --log-level INFO \
+        --daemon \
+        --allow-non-empty
 
     # 5. Wait and verify
     if mount | grep -q "$MOUNT_POINT"; then
