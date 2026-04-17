@@ -1,72 +1,138 @@
-name: Release awsx2
+name: Release
 
 on:
   push:
-    tags:
-      - "awsx2-v*"
+    branches: [master]
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.version.outputs.changed }}
+      version: ${{ steps.version.outputs.current }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if version changed
+        id: version
+        run: |
+          CURRENT_VERSION=$(grep '^version' aws/awsx2/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          git show HEAD~1:aws/awsx2/Cargo.toml > /tmp/old_cargo.toml 2>/dev/null || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
+          OLD_VERSION=$(grep '^version' /tmp/old_cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "old=$OLD_VERSION" >> $GITHUB_OUTPUT
+          if [ "$CURRENT_VERSION" != "$OLD_VERSION" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Version changed: $OLD_VERSION -> $CURRENT_VERSION"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "Version unchanged: $CURRENT_VERSION"
+          fi
+
   build:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: awsx2-x86_64-apple-darwin
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: awsx2-aarch64-apple-darwin
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: awsx2-x86_64-unknown-linux-gnu
+            name: linux-amd64
+            cross: false
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            name: awsx2-aarch64-unknown-linux-gnu
-
-    runs-on: ${{ matrix.os }}
+            name: linux-arm64
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: darwin-amd64
+            cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: darwin-arm64
+            cross: false
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
+      - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools (Linux ARM)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross
 
       - name: Build
+        shell: bash
         working-directory: aws/awsx2
-        run: cargo build --release --target ${{ matrix.target }}
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
 
       - name: Package
         run: |
           cd aws/awsx2/target/${{ matrix.target }}/release
-          tar czf ${{ github.workspace }}/${{ matrix.name }}.tar.gz awsx2
+          tar czf ${{ github.workspace }}/awsx2-${{ matrix.name }}.tar.gz awsx2
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.name }}
-          path: ${{ matrix.name }}.tar.gz
+          name: awsx2-${{ matrix.name }}
+          path: awsx2-${{ matrix.name }}.tar.gz
 
   release:
-    needs: build
+    needs: [check-version, build]
+    if: always() && needs.check-version.outputs.changed == 'true' && !contains(needs.build.result, 'cancelled')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+
+      - name: Create tag
+        run: |
+          git tag "v${{ needs.check-version.outputs.version }}"
+          git push origin "v${{ needs.check-version.outputs.version }}"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
         with:
+          path: artifacts
           merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ needs.check-version.outputs.version }}
+          name: v${{ needs.check-version.outputs.version }}
           generate_release_notes: true
-          files: "*.tar.gz"
+          files: artifacts/*
+
+  publish:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        working-directory: aws/awsx2
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_TOKEN }}
+        run: cargo publish --allow-dirty
