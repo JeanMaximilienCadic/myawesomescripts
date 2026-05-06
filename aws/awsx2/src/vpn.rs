@@ -224,8 +224,9 @@ fn extract_saml_from_query(url_str: &str) -> Option<String> {
         .map(|(_, val)| val.replace(['\n', '\r', ' '], ""))
 }
 
-// ── Phase 3: Browser automation (headless Chrome) ────────────────────────────
+// ── Phase 3: Browser automation (headless Chrome, optional) ──────────────────
 
+#[cfg(feature = "vpn-browser")]
 fn complete_saml_auth(
     saml_url: &str,
     sso_user: &str,
@@ -300,6 +301,7 @@ fn complete_saml_auth(
     Ok(())
 }
 
+#[cfg(feature = "vpn-browser")]
 fn fill_field_and_submit(
     tab: &headless_chrome::Tab,
     selectors: &[&str],
@@ -335,6 +337,18 @@ fn fill_field_and_submit(
         }
     }
     Ok(())
+}
+
+#[cfg(not(feature = "vpn-browser"))]
+fn complete_saml_auth(
+    _saml_url: &str,
+    _sso_user: &str,
+    _sso_pass: &str,
+    _mfa_code: &str,
+) -> Result<()> {
+    Err(AppError::Browser(
+        "headless browser not compiled in — falling back to system browser".into(),
+    ))
 }
 
 fn open_url_in_browser(url: &str) {
