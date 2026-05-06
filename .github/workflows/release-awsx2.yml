@@ -11,7 +11,53 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  auto-bump:
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump patch version if already published on crates.io
+        id: bump
+        run: |
+          VERSION=$(grep '^version' aws/awsx2/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "User-Agent: awsx2-ci/1.0" \
+            "https://crates.io/api/v1/crates/awsx2/$VERSION")
+          if [ "$STATUS" = "200" ]; then
+            NEW=$(echo "$VERSION" | awk -F. '{printf "%s.%s.%d", $1, $2, $3+1}')
+            echo "Version $VERSION already on crates.io — bumping to $NEW"
+            sed -i "s/^version = \"$VERSION\"/version = \"$NEW\"/" aws/awsx2/Cargo.toml
+            python3 - "$VERSION" "$NEW" << 'PYEOF'
+          import re, sys
+          ver, new = sys.argv[1], sys.argv[2]
+          with open("aws/awsx2/Cargo.lock") as f:
+              content = f.read()
+          content = re.sub(
+              r'(name = "awsx2"\nversion = ")' + re.escape(ver) + '"',
+              r'\g<1>' + new + '"',
+              content, count=1
+          )
+          with open("aws/awsx2/Cargo.lock", "w") as f:
+              f.write(content)
+          PYEOF
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add aws/awsx2/Cargo.toml aws/awsx2/Cargo.lock
+            git commit -m "chore: bump awsx2 to $NEW"
+            git push
+            echo "bumped=true" >> $GITHUB_OUTPUT
+          else
+            echo "Version $VERSION not yet on crates.io — no bump needed"
+            echo "bumped=false" >> $GITHUB_OUTPUT
+          fi
+
   check-version:
+    needs: auto-bump
+    if: needs.auto-bump.outputs.bumped != 'true'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.version.outputs.changed }}
