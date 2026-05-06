@@ -24,7 +24,14 @@ fn run_aws(args: &[&str], profile: Option<&str>) -> Result<String> {
     let output = aws_cmd(profile)
         .args(args)
         .args(["--output", "json"])
-        .output()?;
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::AwsCli("aws CLI not found — install it or check your PATH".into())
+            } else {
+                AppError::Io(e)
+            }
+        })?;
     if !output.status.success() {
         return Err(AppError::AwsCli(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -34,7 +41,16 @@ fn run_aws(args: &[&str], profile: Option<&str>) -> Result<String> {
 }
 
 fn run_aws_silent(args: &[&str], profile: Option<&str>) -> Result<()> {
-    let output = aws_cmd(profile).args(args).output()?;
+    let output = aws_cmd(profile)
+        .args(args)
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                AppError::AwsCli("aws CLI not found — install it or check your PATH".into())
+            } else {
+                AppError::Io(e)
+            }
+        })?;
     if !output.status.success() {
         return Err(AppError::AwsCli(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
