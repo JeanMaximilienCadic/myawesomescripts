@@ -20,38 +20,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          fetch-depth: 2
+          fetch-depth: 0
 
-      - name: Resolve version (auto-bump patch if already on crates.io)
+      - name: Resolve version (auto-bump patch if already tagged)
         id: version
         run: |
           CURRENT=$(grep '^version' aws/awsx2/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          git show HEAD~1:aws/awsx2/Cargo.toml > /tmp/old_cargo.toml 2>/dev/null \
-            || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
-          PREV=$(grep '^version' /tmp/old_cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 
-          if [ "$CURRENT" != "$PREV" ]; then
-            echo "Version manually bumped: $PREV -> $CURRENT"
+          # Last released version = highest vX.Y.Z tag (created by the release job)
+          LAST_TAG=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 | sed 's/^v//')
+          LAST_TAG=${LAST_TAG:-"0.0.0"}
+          echo "Current: $CURRENT  Last tag: $LAST_TAG"
+
+          if [ "$CURRENT" != "$LAST_TAG" ]; then
+            echo "Version bumped since last release — proceeding with $CURRENT"
             echo "version=$CURRENT" >> $GITHUB_OUTPUT
             echo "changed=true"     >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Version unchanged vs last commit — check crates.io
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "User-Agent: awsx2-ci/1.0" \
-            "https://crates.io/api/v1/crates/awsx2/$CURRENT")
-
-          if [ "$STATUS" != "200" ]; then
-            echo "Version $CURRENT not yet published and unchanged — nothing to release"
-            echo "version=$CURRENT" >> $GITHUB_OUTPUT
-            echo "changed=false"    >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Already published — auto-bump patch and continue this run
+          # Version matches last tag — auto-bump patch and continue this run
           NEW=$(echo "$CURRENT" | awk -F. '{printf "%s.%s.%d", $1, $2, $3+1}')
-          echo "Version $CURRENT already on crates.io — auto-bumping to $NEW"
+          echo "Version $CURRENT already released — auto-bumping to $NEW"
 
           sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" aws/awsx2/Cargo.toml
 
@@ -106,7 +96,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Check out the HEAD of the branch so the auto-bump commit is included
           ref: master
 
       - name: Setup Rust
