@@ -32,17 +32,22 @@ fn gray(s: impl std::fmt::Display) -> String {
 }
 
 fn find_pid_on_port(port: u16) -> Option<u32> {
-    let out = std::process::Command::new("lsof")
-        .args(["-t", "-i", &format!("TCP:{}", port), "-sTCP:LISTEN"])
-        .output()
-        .ok()?;
-    String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .lines()
-        .next()?
-        .trim()
-        .parse()
-        .ok()
+    // Try LISTEN state first (clean tunnel), then any TCP state (socat with active connections)
+    for args in [
+        vec!["-t", "-i", &format!("TCP:{}", port), "-sTCP:LISTEN"],
+        vec!["-t", "-i", &format!("TCP:{}", port)],
+    ] {
+        let out = std::process::Command::new("lsof").args(&args).output().ok()?;
+        if let Some(pid) = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .lines()
+            .next()
+            .and_then(|l| l.trim().parse::<u32>().ok())
+        {
+            return Some(pid);
+        }
+    }
+    None
 }
 
 fn confirm_and_kill_port(port: u16) -> bool {
