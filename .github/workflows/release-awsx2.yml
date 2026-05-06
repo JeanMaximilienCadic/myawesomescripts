@@ -11,27 +11,51 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  auto-bump:
+  prepare:
     runs-on: ubuntu-latest
     outputs:
-      bumped: ${{ steps.bump.outputs.bumped }}
+      version: ${{ steps.version.outputs.version }}
+      changed: ${{ steps.version.outputs.changed }}
     steps:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 2
 
-      - name: Bump patch version if already published on crates.io
-        id: bump
+      - name: Resolve version (auto-bump patch if already on crates.io)
+        id: version
         run: |
-          VERSION=$(grep '^version' aws/awsx2/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          CURRENT=$(grep '^version' aws/awsx2/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          git show HEAD~1:aws/awsx2/Cargo.toml > /tmp/old_cargo.toml 2>/dev/null \
+            || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
+          PREV=$(grep '^version' /tmp/old_cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+          if [ "$CURRENT" != "$PREV" ]; then
+            echo "Version manually bumped: $PREV -> $CURRENT"
+            echo "version=$CURRENT" >> $GITHUB_OUTPUT
+            echo "changed=true"     >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Version unchanged vs last commit — check crates.io
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             -H "User-Agent: awsx2-ci/1.0" \
-            "https://crates.io/api/v1/crates/awsx2/$VERSION")
-          if [ "$STATUS" = "200" ]; then
-            NEW=$(echo "$VERSION" | awk -F. '{printf "%s.%s.%d", $1, $2, $3+1}')
-            echo "Version $VERSION already on crates.io — bumping to $NEW"
-            sed -i "s/^version = \"$VERSION\"/version = \"$NEW\"/" aws/awsx2/Cargo.toml
-            python3 - "$VERSION" "$NEW" << 'PYEOF'
+            "https://crates.io/api/v1/crates/awsx2/$CURRENT")
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Version $CURRENT not yet published and unchanged — nothing to release"
+            echo "version=$CURRENT" >> $GITHUB_OUTPUT
+            echo "changed=false"    >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Already published — auto-bump patch and continue this run
+          NEW=$(echo "$CURRENT" | awk -F. '{printf "%s.%s.%d", $1, $2, $3+1}')
+          echo "Version $CURRENT already on crates.io — auto-bumping to $NEW"
+
+          sed -i "s/^version = \"$CURRENT\"/version = \"$NEW\"/" aws/awsx2/Cargo.toml
+
+          python3 - "$CURRENT" "$NEW" << 'PYEOF'
           import re, sys
           ver, new = sys.argv[1], sys.argv[2]
           with open("aws/awsx2/Cargo.lock") as f:
@@ -39,53 +63,24 @@ jobs:
           content = re.sub(
               r'(name = "awsx2"\nversion = ")' + re.escape(ver) + '"',
               r'\g<1>' + new + '"',
-              content, count=1
+              content, count=1,
           )
           with open("aws/awsx2/Cargo.lock", "w") as f:
               f.write(content)
           PYEOF
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add aws/awsx2/Cargo.toml aws/awsx2/Cargo.lock
-            git commit -m "chore: bump awsx2 to $NEW"
-            git push
-            echo "bumped=true" >> $GITHUB_OUTPUT
-          else
-            echo "Version $VERSION not yet on crates.io — no bump needed"
-            echo "bumped=false" >> $GITHUB_OUTPUT
-          fi
 
-  check-version:
-    needs: auto-bump
-    if: needs.auto-bump.outputs.bumped != 'true'
-    runs-on: ubuntu-latest
-    outputs:
-      changed: ${{ steps.version.outputs.changed }}
-      version: ${{ steps.version.outputs.current }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add aws/awsx2/Cargo.toml aws/awsx2/Cargo.lock
+          git commit -m "chore: bump awsx2 to $NEW"
+          git push
 
-      - name: Check if version changed
-        id: version
-        run: |
-          CURRENT_VERSION=$(grep '^version' aws/awsx2/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          git show HEAD~1:aws/awsx2/Cargo.toml > /tmp/old_cargo.toml 2>/dev/null || echo 'version = "0.0.0"' > /tmp/old_cargo.toml
-          OLD_VERSION=$(grep '^version' /tmp/old_cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-          echo "current=$CURRENT_VERSION" >> $GITHUB_OUTPUT
-          echo "old=$OLD_VERSION" >> $GITHUB_OUTPUT
-          if [ "$CURRENT_VERSION" != "$OLD_VERSION" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Version changed: $OLD_VERSION -> $CURRENT_VERSION"
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "Version unchanged: $CURRENT_VERSION"
-          fi
+          echo "version=$NEW"   >> $GITHUB_OUTPUT
+          echo "changed=true"   >> $GITHUB_OUTPUT
 
   build:
-    needs: check-version
-    if: needs.check-version.outputs.changed == 'true'
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -110,6 +105,9 @@ jobs:
             cross: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Check out the HEAD of the branch so the auto-bump commit is included
+          ref: master
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -142,16 +140,18 @@ jobs:
           path: awsx2-${{ matrix.name }}.tar.gz
 
   release:
-    needs: [check-version, build]
-    if: always() && needs.check-version.outputs.changed == 'true' && !contains(needs.build.result, 'cancelled')
+    needs: [prepare, build]
+    if: always() && needs.prepare.outputs.changed == 'true' && !contains(needs.build.result, 'cancelled')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: master
 
       - name: Create tag
         run: |
-          git tag "v${{ needs.check-version.outputs.version }}"
-          git push origin "v${{ needs.check-version.outputs.version }}"
+          git tag "v${{ needs.prepare.outputs.version }}"
+          git push origin "v${{ needs.prepare.outputs.version }}"
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -162,17 +162,19 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.check-version.outputs.version }}
-          name: v${{ needs.check-version.outputs.version }}
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: v${{ needs.prepare.outputs.version }}
           generate_release_notes: true
           files: artifacts/*
 
   publish:
-    needs: check-version
-    if: needs.check-version.outputs.changed == 'true'
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: master
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
