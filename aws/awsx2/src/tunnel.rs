@@ -44,22 +44,17 @@ fn probe_remote(port: u16) -> Option<u64> {
     }
 }
 
-/// Wait for the port to open, probe the remote end, and kill the tunnel
-/// process if the remote is unreachable.  Returns latency on success.
+/// Wait for the SSM port to open, then probe the remote service.
+/// Only kills the tunnel if the SSM session itself fails to open (port never binds).
+/// A silent remote (service down/restarting) is not a reason to tear down the tunnel.
 fn wait_and_probe(port: u16, pid: u32, timeout: Duration) -> Result<u64> {
     if let Err(e) = wait_for_port(port, timeout) {
         stop_tunnel(pid);
         return Err(e);
     }
-    match probe_remote(port) {
-        Some(ms) => Ok(ms),
-        None => {
-            stop_tunnel(pid);
-            Err(AppError::Tunnel(format!(
-                "Remote service unreachable — no response on port {} within 5 s", port
-            )))
-        }
-    }
+    // Remote probe is best-effort: service may be temporarily unavailable.
+    // Keep the tunnel alive regardless — it will work once the service is back.
+    Ok(probe_remote(port).unwrap_or(0))
 }
 
 fn wait_for_port(port: u16, timeout: Duration) -> Result<()> {
@@ -236,23 +231,23 @@ pub fn start_url_tunnel_via_any_bastion(
         Some(rp) => rp,
         None => {
             let default_port: u16 = if url.starts_with("https://") { 443 } else { 80 };
-            println!("  Auto-detecting port on {}...", host);
+            println!("\x1b[90m  Auto-detecting port on {}...\x1b[0m", host);
             match aws::probe_ports_via_bastion(
                 &online_bastions[0].id, &host, aws::COMMON_PORTS, profile,
             ) {
                 Ok(ref open) if !open.is_empty() => {
                     println!(
-                        "  Open ports: {}",
+                        "\x1b[90m  Open ports: {}\x1b[0m",
                         open.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
                     );
                     if open.contains(&default_port) { default_port } else { open[0] }
                 }
                 Ok(_) => {
-                    println!("  No open ports found, falling back to {}", default_port);
+                    println!("\x1b[90m  No open ports found, falling back to {}\x1b[0m", default_port);
                     default_port
                 }
                 Err(e) => {
-                    println!("  Port probe failed ({}), falling back to {}", e, default_port);
+                    println!("\x1b[90m  Port probe failed ({}), falling back to {}\x1b[0m", e, default_port);
                     default_port
                 }
             }
@@ -263,6 +258,8 @@ pub fn start_url_tunnel_via_any_bastion(
         let child = start_remote_tunnel(&bastion.id, &host, local_port, remote_port, profile)?;
         let pid = child.id();
         std::mem::forget(child);
+        // wait_and_probe only fails if the SSM session itself never opened.
+        // Remote-service unavailability is tolerated — the tunnel stays alive.
         match wait_and_probe(local_port, pid, Duration::from_secs(10)) {
             Ok(latency_ms) => {
                 return Ok(TunnelProcess {
@@ -273,13 +270,13 @@ pub fn start_url_tunnel_via_any_bastion(
                 });
             }
             Err(_) => {
-                stop_tunnel(pid);
+                // SSM session failed to bind — try next bastion.
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
     }
     Err(AppError::Tunnel(format!(
-        "All {} bastion(s) failed to tunnel to {}:{}", online_bastions.len(), host, remote_port
+        "All {} bastion(s) failed to establish SSM tunnel to {}:{}", online_bastions.len(), host, remote_port
     )))
 }
 

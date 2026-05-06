@@ -25,6 +25,49 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::tui::app::{App, ConfirmTag, InputTag, Popup, Tab};
 use crate::tui::pages;
 
+// ── ANSI helpers ─────────────────────────────────────────────────────────────
+
+fn gray(s: impl std::fmt::Display) -> String {
+    format!("\x1b[90m{}\x1b[0m", s)
+}
+
+fn find_pid_on_port(port: u16) -> Option<u32> {
+    let out = std::process::Command::new("lsof")
+        .args(["-t", "-i", &format!("TCP:{}", port), "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn confirm_and_kill_port(port: u16) -> bool {
+    match find_pid_on_port(port) {
+        Some(pid) => {
+            eprint!("Port {} in use by PID {}. Kill it and proceed? [y/N] ", port, pid);
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let mut s = String::new();
+            if std::io::stdin().read_line(&mut s).is_err() { return false; }
+            if s.trim().eq_ignore_ascii_case("y") {
+                #[cfg(unix)]
+                unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                true
+            } else {
+                false
+            }
+        }
+        None => {
+            eprintln!("Port {} already in use (could not identify owning process).", port);
+            false
+        }
+    }
+}
+
 // ── CLI spinner ───────────────────────────────────────────────────────────────
 
 struct Spinner {
@@ -289,21 +332,21 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
 
         Cmd::Start { name } => {
             let inst = aws::find_instance_by_name(&name, None)?;
-            println!("Starting {} ({})...", inst.name, inst.id);
+            println!("{}", gray(format!("Starting {} ({})...", inst.name, inst.id)));
             aws::start_instance(&inst.id, None)?;
             println!("Start command sent.");
         }
 
         Cmd::Stop { name } => {
             let inst = aws::find_instance_by_name(&name, None)?;
-            println!("Stopping {} ({})...", inst.name, inst.id);
+            println!("{}", gray(format!("Stopping {} ({})...", inst.name, inst.id)));
             aws::stop_instance(&inst.id, false, None)?;
             println!("Stop command sent.");
         }
 
         Cmd::ForceStop { name } => {
             let inst = aws::find_instance_by_name(&name, None)?;
-            println!("Force-stopping {} ({})...", inst.name, inst.id);
+            println!("{}", gray(format!("Force-stopping {} ({})...", inst.name, inst.id)));
             aws::stop_instance(&inst.id, true, None)?;
             println!("Force-stop command sent.");
         }
@@ -318,9 +361,9 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 }
             };
             let inst = aws::find_instance_by_name(&name, None)?;
-            println!("Switching {} ({}) to {}...", inst.name, inst.id, new_type);
+            println!("{}", gray(format!("Switching {} ({}) to {}...", inst.name, inst.id, new_type)));
             if inst.state == models::InstanceState::Running {
-                println!("Stopping instance first...");
+                println!("{}", gray("Stopping instance first..."));
                 aws::stop_instance(&inst.id, false, None)?;
             }
             aws::modify_instance_type(&inst.id, new_type, None)?;
@@ -345,10 +388,10 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 .or_else(|| std::env::var("AWS_PROFILE").ok())
                 .unwrap_or_default();
             let profile_opt = if profile_str.is_empty() { None } else { Some(profile_str.as_str()) };
-            println!("Running: aws sso login{}",
-                profile_opt.map(|p| format!(" --profile {}", p)).unwrap_or_default());
+            println!("{}", gray(format!("Running: aws sso login{}",
+                profile_opt.map(|p| format!(" --profile {}", p)).unwrap_or_default())));
             aws::sso_login(profile_opt)?;
-            println!("\nVerifying identity...");
+            println!("{}", gray("\nVerifying identity..."));
             println!("{}", aws::get_caller_identity(profile_opt)?);
         }
 
@@ -358,8 +401,9 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
 
         Cmd::Tunnel { pattern, local_port, remote_port, bind } => {
             if tunnel::test_port(local_port) {
-                println!("Port {} already in use (tunnel may be active).", local_port);
-                return Ok(());
+                if !confirm_and_kill_port(local_port) {
+                    return Ok(());
+                }
             }
 
             let needs_forwarder = bind != "127.0.0.1";
@@ -369,7 +413,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 local_port
             };
 
-            println!("Starting tunnel: *{}*:{} -> {}:{}", pattern, remote_port, bind, local_port);
+            println!("{}", gray(format!("Starting tunnel: *{}*:{} -> {}:{}", pattern, remote_port, bind, local_port)));
             let tp = tunnel::start_tunnel_by_pattern(&pattern, ssm_port, remote_port, None)?;
 
             if needs_forwarder {
@@ -383,11 +427,12 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
 
         Cmd::TunnelUrl { url, local_port, remote_port, proxy, bind } => {
             if tunnel::test_port(local_port) {
-                println!("Port {} already in use.", local_port);
-                return Ok(());
+                if !confirm_and_kill_port(local_port) {
+                    return Ok(());
+                }
             }
             let host = aws::strip_url_to_host(&url);
-            println!("Resolving {}...", host);
+            println!("{}", gray(format!("Resolving {}...", host)));
 
             let needs_forwarder = bind != "127.0.0.1";
             let ssm_port = if needs_forwarder {
@@ -422,7 +467,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 }
                 _ => {
                     // Fallback: try all SSM-online bastions directly
-                    println!("  Trying bastions...");
+                    println!("{}", gray("  Trying bastions..."));
                     let tp = tunnel::start_url_tunnel_via_any_bastion(&url, ssm_port, remote_port, None)?;
                     if needs_forwarder {
                         let fwd_pid = tunnel::start_bind_forwarder(&bind, local_port, ssm_port)?;
@@ -441,7 +486,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             };
 
             if tunneled && proxy {
-                println!("Setting up reverse proxy...");
+                println!("{}", gray("Setting up reverse proxy..."));
                 proxy::setup_proxy(&host, local_port)?;
                 println!("Access: http://{}", host);
             }
@@ -449,20 +494,22 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
 
         Cmd::TunnelDns { url, local_port, remote_port } => {
             if tunnel::test_port(local_port) {
-                println!("Port {} already in use.", local_port);
-                return Ok(());
+                if !confirm_and_kill_port(local_port) {
+                    return Ok(());
+                }
             }
-            println!("Resolving {} for tunnel...", url);
+            println!("{}", gray(format!("Resolving {} for tunnel...", url)));
             let tp = tunnel::start_dns_tunnel(&url, local_port, remote_port, None)?;
             println!("Tunnel active: localhost:{} -> {}:{}", tp.local_port, tp.instance_name, tp.remote_port);
         }
 
         Cmd::TunnelRemote { bastion, host, local_port, remote_port } => {
             if tunnel::test_port(local_port) {
-                println!("Port {} already in use.", local_port);
-                return Ok(());
+                if !confirm_and_kill_port(local_port) {
+                    return Ok(());
+                }
             }
-            println!("Starting remote tunnel via *{}* -> {}:{}", bastion, host, remote_port);
+            println!("{}", gray(format!("Starting remote tunnel via *{}* -> {}:{}", bastion, host, remote_port)));
             let tp = tunnel::start_remote_tunnel_via_pattern(&bastion, &host, local_port, remote_port, None)?;
             println!("Tunnel active: localhost:{} -> {}:{} via {}", tp.local_port, host, remote_port, tp.instance_name);
         }
@@ -470,7 +517,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
         Cmd::TunnelStop => {
             tunnel::stop_all_tunnels();
             if proxy::has_active_proxies() {
-                println!("Cleaning up reverse proxies...");
+                println!("{}", gray("Cleaning up reverse proxies..."));
                 proxy::teardown_all_proxies();
             }
             println!("All SSM tunnels stopped.");
@@ -671,8 +718,8 @@ fn try_alb_tunnel(
             Some(inst) => inst,
             None => continue,
         };
-        println!("  ALB target: {}:{}", target_ip, target_port);
-        println!("  Via: {}", hop.name);
+        println!("{}", gray(format!("  ALB target: {}:{}", target_ip, target_port)));
+        println!("{}", gray(format!("  Via: {}", hop.name)));
 
         let tp = tunnel::start_remote_tunnel_via_instance(
             &hop.id, &hop.name, target_ip, local_port, *target_port, None,
