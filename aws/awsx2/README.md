@@ -12,6 +12,7 @@ awsx2 list     # CLI mode — list all instances
 - **Dual-mode** — full-screen TUI for interactive use, CLI for scripts and automation
 - **EC2 management** — list, start, stop, force-stop, switch instance types (GPU/CPU)
 - **Smart tunneling** — SSM port-forwarding with ALB-aware routing, security group analysis, and bastion fallback
+- **Persistent tunnels** — self-healing supervisor that auto-reconnects dropped SSM tunnels, with an optional macOS LaunchAgent for boot/login survival
 - **Client VPN** — AWS Client VPN with SAML/SSO authentication, headless browser MFA, and automatic DNS configuration
 - **Reverse proxy** — auto-configures nginx + `/etc/hosts` so internal URLs work directly in the browser
 - **Cross-platform** — macOS (Homebrew) and Linux (Debian/Ubuntu, RHEL/CentOS, Amazon Linux)
@@ -125,8 +126,47 @@ awsx2 tunnel-remote bastion 10.0.1.42 8080 8501
 
 ```bash
 awsx2 tunnel-test 8080    # Check if port is open
-awsx2 tunnel-stop         # Kill all SSM tunnels + clean up proxies
+awsx2 tunnel-stop         # Kill all SSM tunnels (and any supervisor) + clean up proxies
 ```
+
+### Persistent tunnels (self-healing)
+
+A normal `awsx2 tunnel` is fire-and-forget: if the SSM session drops (container
+restart on the instance, idle/WebSocket timeout, laptop sleep, instance reboot)
+the tunnel dies and you must re-open it. Persistent tunnels are **supervised** —
+the supervisor watches each tunnel and re-establishes it automatically, and can
+survive logout/reboot via a macOS LaunchAgent.
+
+```bash
+# Open + supervise one tunnel (auto-reconnect; also saved to the registry)
+awsx2 tunnel dev-risk-model-ec2 18000 8000 --keep-alive
+
+# Bring up & supervise EVERY registered tunnel in one process
+awsx2 tunnel-up
+
+# Inspect what's registered and whether the supervisor is running
+awsx2 tunnel-list
+
+# Remove a registered tunnel (by local port or name)
+awsx2 tunnel-rm 18000
+
+# Start the supervisor automatically at login and keep it alive (macOS)
+awsx2 tunnel-install      # writes ~/Library/LaunchAgents/com.awsx2.tunnels.plist
+awsx2 tunnel-uninstall    # removes it
+```
+
+The registry lives at `~/.config/awsx2/tunnels.json`; the LaunchAgent logs to
+`~/Library/Logs/awsx2-tunnels.{out,err}.log`.
+
+**Reconnect policy.** The supervisor reconnects when the tunnel itself is gone
+(SSM `session-manager-plugin` process/listener down, or — for `0.0.0.0` binds —
+the `socat` forwarder down). It deliberately does **not** reconnect merely
+because the remote service is briefly unreachable; that tunnel is still healthy
+and reconnecting would not help.
+
+**SSO caveat.** A LaunchAgent cannot run interactive `aws sso login`. After your
+SSO session expires the supervisor keeps retrying with backoff and logs a hint;
+tunnels recover automatically the moment you run `awsx2 login` again.
 
 ### SSH via SSM
 
