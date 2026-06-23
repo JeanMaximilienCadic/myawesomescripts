@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crate::aws;
 use crate::error::{AppError, Result};
 use crate::models::{TunnelProcess, TunnelTarget};
+use crate::registry::{TunnelKind, TunnelSpec};
 
 // ── Port testing ──────────────────────────────────────────────────────────────
 
@@ -395,6 +396,103 @@ pub fn find_available_port(start: u16) -> u16 {
     start + 100 // fallback
 }
 
+// ── Managed unit (SSM session + optional socat forwarder) ─────────────────────
+
+/// A live tunnel as supervised by the persistence layer. A unit is the SSM
+/// `session-manager-plugin` process (`ssm_pid`, listening on `ssm_port`) plus
+/// an optional `socat` forwarder (`fwd_pid`) that exposes `spec.local_port`
+/// on `spec.bind` when the bind address is not loopback.
+#[derive(Debug, Clone)]
+pub struct TunnelUnit {
+    pub spec: TunnelSpec,
+    pub ssm_pid: u32,
+    pub ssm_port: u16,
+    pub fwd_pid: Option<u32>,
+    pub instance_name: String,
+}
+
+/// True if the process is still alive (best-effort, via signal 0 on unix).
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// Pure health decision so the policy is unit-testable without real processes.
+/// Healthy = SSM session alive AND (forwarder alive, if present) AND the local
+/// listener accepts connections. Deliberately ignores remote-service silence.
+pub fn unit_healthy_from(ssm_alive: bool, fwd_alive: Option<bool>, port_open: bool) -> bool {
+    ssm_alive && fwd_alive.unwrap_or(true) && port_open
+}
+
+/// Live health probe for a unit using the pure decision above.
+pub fn is_unit_healthy(unit: &TunnelUnit) -> bool {
+    let ssm_alive = pid_alive(unit.ssm_pid);
+    let fwd_alive = unit.fwd_pid.map(pid_alive);
+    let port_open = test_port(unit.spec.local_port);
+    unit_healthy_from(ssm_alive, fwd_alive, port_open)
+}
+
+/// Establish a complete tunnel unit from a spec: SSM session plus, when the
+/// bind address is not loopback, a socat forwarder. Encapsulates the
+/// needs-forwarder / ssm_port logic shared by the one-shot path and the
+/// supervisor.
+pub fn establish_unit(spec: &TunnelSpec) -> Result<TunnelUnit> {
+    let needs_forwarder = spec.bind != "127.0.0.1";
+    let ssm_port = if needs_forwarder {
+        find_available_port(spec.local_port + 10000)
+    } else {
+        spec.local_port
+    };
+    let profile = spec.profile.as_deref();
+
+    let tp = match spec.kind {
+        TunnelKind::Direct => {
+            start_tunnel_by_pattern(&spec.pattern, ssm_port, spec.remote_port, profile)?
+        }
+        TunnelKind::Remote => {
+            let host = spec.host.as_deref().ok_or_else(|| {
+                AppError::Tunnel("remote tunnel spec requires a host".into())
+            })?;
+            start_remote_tunnel_via_pattern(&spec.pattern, host, ssm_port, spec.remote_port, profile)?
+        }
+    };
+
+    let fwd_pid = if needs_forwarder {
+        Some(start_bind_forwarder(&spec.bind, spec.local_port, ssm_port)?)
+    } else {
+        None
+    };
+
+    Ok(TunnelUnit {
+        spec: spec.clone(),
+        ssm_pid: tp.pid,
+        ssm_port,
+        fwd_pid,
+        instance_name: tp.instance_name,
+    })
+}
+
+/// Tear down a unit completely: the SSM session, the forwarder (if any), and
+/// any session-manager-plugin still bound to the unit's internal port.
+pub fn stop_unit(unit: &TunnelUnit) {
+    stop_tunnel(unit.ssm_pid);
+    if let Some(f) = unit.fwd_pid {
+        stop_tunnel(f);
+    }
+    for t in detect_tunnels() {
+        if t.local_port == unit.ssm_port {
+            stop_tunnel(t.pid);
+        }
+    }
+}
+
 // ── Stop tunnels ──────────────────────────────────────────────────────────────
 
 pub fn stop_tunnel(pid: u32) {
@@ -407,4 +505,19 @@ pub fn stop_tunnel(pid: u32) {
 pub fn stop_all_tunnels() {
     for t in detect_tunnels() { stop_tunnel(t.pid); }
     let _ = Command::new("pkill").args(["-f", "session-manager-plugin"]).status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthy_requires_all_signals() {
+        assert!(unit_healthy_from(true, Some(true), true));
+        assert!(unit_healthy_from(true, None, true)); // no forwarder
+        assert!(!unit_healthy_from(false, Some(true), true)); // ssm dead
+        assert!(!unit_healthy_from(true, Some(false), true)); // socat dead
+        assert!(!unit_healthy_from(true, Some(true), false)); // port closed
+        assert!(!unit_healthy_from(true, None, false)); // port closed, no forwarder
+    }
 }

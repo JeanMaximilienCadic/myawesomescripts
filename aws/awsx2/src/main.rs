@@ -412,22 +412,25 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 }
             }
 
-            let needs_forwarder = bind != "127.0.0.1";
-            let ssm_port = if needs_forwarder {
-                tunnel::find_available_port(local_port + 10000)
-            } else {
-                local_port
+            let spec = registry::TunnelSpec {
+                name: None,
+                kind: registry::TunnelKind::Direct,
+                pattern: pattern.clone(),
+                host: None,
+                local_port,
+                remote_port,
+                bind: bind.clone(),
+                profile: None,
             };
 
             println!("{}", gray(format!("Starting tunnel: *{}*:{} -> {}:{}", pattern, remote_port, bind, local_port)));
-            let tp = tunnel::start_tunnel_by_pattern(&pattern, ssm_port, remote_port, None)?;
+            let unit = tunnel::establish_unit(&spec)?;
 
-            if needs_forwarder {
-                let fwd_pid = tunnel::start_bind_forwarder(&bind, local_port, ssm_port)?;
+            if let Some(fwd_pid) = unit.fwd_pid {
                 println!("Tunnel active: {}:{} -> {}:{} (forwarder pid {})",
-                    bind, local_port, tp.instance_name, tp.remote_port, fwd_pid);
+                    bind, local_port, unit.instance_name, remote_port, fwd_pid);
             } else {
-                println!("Tunnel active: localhost:{} -> {}:{}", tp.local_port, tp.instance_name, tp.remote_port);
+                println!("Tunnel active: localhost:{} -> {}:{}", local_port, unit.instance_name, remote_port);
             }
         }
 
