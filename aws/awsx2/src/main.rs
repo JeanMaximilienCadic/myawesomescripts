@@ -8,6 +8,7 @@ mod error;
 mod models;
 mod proxy;
 mod registry;
+mod supervisor;
 mod tunnel;
 mod tui;
 mod vpn;
