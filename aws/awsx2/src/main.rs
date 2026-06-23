@@ -474,7 +474,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
 
             let needs_forwarder = bind != "127.0.0.1";
             let ssm_port = if needs_forwarder {
-                tunnel::find_available_port(local_port + 10000)
+                tunnel::alloc_internal_port()
             } else {
                 local_port
             };

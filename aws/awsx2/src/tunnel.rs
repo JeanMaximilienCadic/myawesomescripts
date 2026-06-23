@@ -3,6 +3,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::aws;
@@ -396,6 +397,23 @@ pub fn find_available_port(start: u16) -> u16 {
     start + 100 // fallback
 }
 
+/// Base for internal SSM listener ports used behind a socat forwarder. Kept
+/// high enough to avoid colliding with typical user-facing local ports — a
+/// naive `local_port + 10000` would map 18000 -> 28000, clashing with another
+/// tunnel whose local port is 28000.
+static INTERNAL_PORT_CURSOR: AtomicU16 = AtomicU16::new(41000);
+
+/// Allocate a unique, free internal port for an SSM listener. Each call scans
+/// from a distinct base so units establishing concurrently never race onto the
+/// same port.
+pub fn alloc_internal_port() -> u16 {
+    let mut base = INTERNAL_PORT_CURSOR.fetch_add(200, Ordering::SeqCst);
+    if base < 41000 {
+        base = 41000; // recover from the rare wrap-around
+    }
+    find_available_port(base)
+}
+
 // ── Managed unit (SSM session + optional socat forwarder) ─────────────────────
 
 /// A live tunnel as supervised by the persistence layer. A unit is the SSM
@@ -453,7 +471,7 @@ pub fn is_unit_healthy(unit: &TunnelUnit) -> bool {
 pub fn establish_unit(spec: &TunnelSpec) -> Result<TunnelUnit> {
     let needs_forwarder = spec.bind != "127.0.0.1";
     let ssm_port = if needs_forwarder {
-        find_available_port(spec.local_port + 10000)
+        alloc_internal_port()
     } else {
         spec.local_port
     };
