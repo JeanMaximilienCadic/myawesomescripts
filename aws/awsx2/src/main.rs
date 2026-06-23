@@ -5,6 +5,7 @@
 
 mod aws;
 mod error;
+mod launchd;
 mod models;
 mod proxy;
 mod registry;
