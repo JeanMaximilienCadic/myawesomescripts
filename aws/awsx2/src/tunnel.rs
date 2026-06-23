@@ -425,15 +425,22 @@ pub fn pid_alive(pid: u32) -> bool {
 }
 
 /// Pure health decision so the policy is unit-testable without real processes.
-/// Healthy = SSM session alive AND (forwarder alive, if present) AND the local
-/// listener accepts connections. Deliberately ignores remote-service silence.
+/// Healthy = SSM listener alive AND (forwarder alive, if present) AND the
+/// user-facing listener accepts connections. Deliberately ignores
+/// remote-service silence (we never probe the remote here).
 pub fn unit_healthy_from(ssm_alive: bool, fwd_alive: Option<bool>, port_open: bool) -> bool {
     ssm_alive && fwd_alive.unwrap_or(true) && port_open
 }
 
 /// Live health probe for a unit using the pure decision above.
+///
+/// `ssm_alive` requires BOTH the `aws` wrapper process to be alive AND the
+/// internal `ssm_port` to still accept connections — the latter reflects the
+/// `session-manager-plugin` itself, which can die (e.g. on a dropped SSM
+/// WebSocket / container restart) while the wrapper lingers and while a socat
+/// forwarder keeps the user-facing port superficially "open".
 pub fn is_unit_healthy(unit: &TunnelUnit) -> bool {
-    let ssm_alive = pid_alive(unit.ssm_pid);
+    let ssm_alive = pid_alive(unit.ssm_pid) && test_port(unit.ssm_port);
     let fwd_alive = unit.fwd_pid.map(pid_alive);
     let port_open = test_port(unit.spec.local_port);
     unit_healthy_from(ssm_alive, fwd_alive, port_open)
