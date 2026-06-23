@@ -18,6 +18,10 @@ pub enum AppError {
     NoBastions,
     #[error("Port {0} is not open after timeout")]
     PortClosed(u16),
+    #[error("Registry error: {0}")]
+    Registry(String),
+    #[error("launchd error: {0}")]
+    Launchd(String),
     #[error("VPN error: {0}")]
     Vpn(String),
     #[error("SAML authentication failed: {0}")]

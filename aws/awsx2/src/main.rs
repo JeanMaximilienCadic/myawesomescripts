@@ -7,6 +7,7 @@ mod aws;
 mod error;
 mod models;
 mod proxy;
+mod registry;
 mod tunnel;
 mod tui;
 mod vpn;
