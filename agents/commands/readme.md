@@ -9,8 +9,16 @@ The README must follow this HTML/Markdown template structure. Adapt the content 
 ```html
 <h1 align="center">
   <br>
-  <img src="<project-logo-url-if-available>">
+  <img src="PROJECT_LOGO_URL" alt="PROJECT_NAME" width="200">
+  <br>
+  PROJECT_NAME
+  <br>
 </h1>
+
+<p align="center">
+  One-sentence description of what the project does.
+</p>
+
 <p align="center">
   <a href="#modules">Modules</a> •
   <a href="#code-structure">Code structure</a> •
@@ -21,7 +29,16 @@ The README must follow this HTML/Markdown template structure. Adapt the content 
   <a href="#running-the-application">Running the application</a> •
   <a href="#changelog">Changelog</a>
 </p>
+
+---
 ```
+
+### Header rules
+
+- `PROJECT_NAME` and `PROJECT_LOGO_URL` are placeholders to substitute, not literal text. Never emit a placeholder wrapped in angle brackets (`<project-logo-url>`): inside HTML the browser parses it as a tag, so the title vanishes and the image renders broken.
+- **If the project has no logo, delete the `<img>` line and the `<br>` above it.** An `<img>` with an unresolved `src` renders as a broken-image icon. The heading must always carry the project name as text, so it stays readable with or without a logo.
+- Keep a blank line between `</p>` and the first Markdown heading. Without it GitHub keeps parsing in HTML-block mode and the section below is swallowed.
+- Only link nav entries whose sections actually exist (e.g. drop `Taskfile commands` when the project has no `Taskfile.yml`). A nav link to a missing heading is a dead anchor.
 
 Followed by these sections:
 
