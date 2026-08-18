@@ -5,8 +5,11 @@
 
 mod aws;
 mod error;
+mod launchd;
 mod models;
 mod proxy;
+mod registry;
+mod supervisor;
 mod tunnel;
 mod tui;
 mod vpn;
@@ -179,6 +182,10 @@ enum Cmd {
         /// Bind address (default: 0.0.0.0 for Docker/external access)
         #[arg(long, default_value = "0.0.0.0")]
         bind: String,
+        /// Persist this tunnel and supervise it: auto-reconnect on drop and
+        /// save it to the registry so `tunnel-up` can restore it later.
+        #[arg(long)]
+        keep_alive: bool,
     },
     /// Tunnel to any internal URL (smart ALB resolution + bastion fallback)
     TunnelUrl {
@@ -210,12 +217,25 @@ enum Cmd {
         #[arg(default_value = "8501")]
         remote_port: u16,
     },
-    /// Kill all running SSM tunnel processes
+    /// Kill all running SSM tunnel processes (and any persistent supervisor)
     TunnelStop,
     /// Test if a local tunnel port is open
     TunnelTest {
         local_port: u16,
     },
+    /// Establish and supervise ALL registered (persistent) tunnels
+    TunnelUp,
+    /// List registered persistent tunnels with their live status
+    TunnelList,
+    /// Remove a registered tunnel by local port or name
+    TunnelRm {
+        /// Local port number or tunnel name
+        key: String,
+    },
+    /// Install a macOS LaunchAgent that runs `tunnel-up` at login (KeepAlive)
+    TunnelInstall,
+    /// Remove the macOS LaunchAgent installed by `tunnel-install`
+    TunnelUninstall,
     /// List ECR images (like `docker images`). Omit repository to scan all repos.
     EcrImages {
         /// ECR repository name (omit to list all repositories)
@@ -404,29 +424,42 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
             println!("{}", aws::resolve_dns_report(&url, None)?);
         }
 
-        Cmd::Tunnel { pattern, local_port, remote_port, bind } => {
+        Cmd::Tunnel { pattern, local_port, remote_port, bind, keep_alive } => {
             if tunnel::test_port(local_port) {
                 if !confirm_and_kill_port(local_port) {
                     return Ok(());
                 }
             }
 
-            let needs_forwarder = bind != "127.0.0.1";
-            let ssm_port = if needs_forwarder {
-                tunnel::find_available_port(local_port + 10000)
-            } else {
-                local_port
+            let spec = registry::TunnelSpec {
+                name: None,
+                kind: registry::TunnelKind::Direct,
+                pattern: pattern.clone(),
+                host: None,
+                local_port,
+                remote_port,
+                bind: bind.clone(),
+                profile: None,
             };
 
-            println!("{}", gray(format!("Starting tunnel: *{}*:{} -> {}:{}", pattern, remote_port, bind, local_port)));
-            let tp = tunnel::start_tunnel_by_pattern(&pattern, ssm_port, remote_port, None)?;
+            if keep_alive {
+                registry::upsert(spec.clone())?;
+                println!("{}", gray(format!(
+                    "Supervising *{}*:{} -> {}:{} (persistent; saved to registry). Ctrl-C to stop.",
+                    pattern, remote_port, bind, local_port
+                )));
+                supervisor::supervise_all(vec![spec])?;
+                return Ok(());
+            }
 
-            if needs_forwarder {
-                let fwd_pid = tunnel::start_bind_forwarder(&bind, local_port, ssm_port)?;
+            println!("{}", gray(format!("Starting tunnel: *{}*:{} -> {}:{}", pattern, remote_port, bind, local_port)));
+            let unit = tunnel::establish_unit(&spec)?;
+
+            if let Some(fwd_pid) = unit.fwd_pid {
                 println!("Tunnel active: {}:{} -> {}:{} (forwarder pid {})",
-                    bind, local_port, tp.instance_name, tp.remote_port, fwd_pid);
+                    bind, local_port, unit.instance_name, remote_port, fwd_pid);
             } else {
-                println!("Tunnel active: localhost:{} -> {}:{}", tp.local_port, tp.instance_name, tp.remote_port);
+                println!("Tunnel active: localhost:{} -> {}:{}", local_port, unit.instance_name, remote_port);
             }
         }
 
@@ -441,7 +474,7 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
 
             let needs_forwarder = bind != "127.0.0.1";
             let ssm_port = if needs_forwarder {
-                tunnel::find_available_port(local_port + 10000)
+                tunnel::alloc_internal_port()
             } else {
                 local_port
             };
@@ -520,6 +553,13 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
         }
 
         Cmd::TunnelStop => {
+            // Stop the persistent supervisor FIRST so it cannot resurrect the
+            // tunnels we are about to kill.
+            if let Some(pid) = supervisor::read_pid_file() {
+                println!("{}", gray(format!("Stopping persistent supervisor (pid {})...", pid)));
+                tunnel::stop_tunnel(pid);
+                supervisor::clear_pid_file();
+            }
             tunnel::stop_all_tunnels();
             if proxy::has_active_proxies() {
                 println!("{}", gray("Cleaning up reverse proxies..."));
@@ -535,6 +575,68 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
                 eprintln!("Port {} is CLOSED.", local_port);
                 std::process::exit(1);
             }
+        }
+
+        Cmd::TunnelUp => {
+            let specs = registry::load()?;
+            if specs.is_empty() {
+                println!("No persistent tunnels registered. Add one with:");
+                println!("  awsx2 tunnel <pattern> <local_port> <remote_port> --keep-alive");
+                return Ok(());
+            }
+            println!("{}", gray(format!("Bringing up {} registered tunnel(s)...", specs.len())));
+            supervisor::supervise_all(specs)?;
+        }
+
+        Cmd::TunnelList => {
+            let specs = registry::load()?;
+            if specs.is_empty() {
+                println!("No persistent tunnels registered.");
+                return Ok(());
+            }
+            let live = tunnel::detect_tunnels();
+            let supervisor = supervisor::read_pid_file();
+            println!("Supervisor: {}", match supervisor {
+                Some(pid) => format!("running (pid {})", pid),
+                None => "not running".to_string(),
+            });
+            println!("{:<20} {:<28} {:>7} {:>7} {:>8}", "NAME", "TARGET", "LOCAL", "REMOTE", "STATUS");
+            for s in &specs {
+                let up = tunnel::test_port(s.local_port);
+                let detected = live.iter().any(|t| t.local_port == s.local_port);
+                let status = if up { "UP" } else if detected { "STARTING" } else { "DOWN" };
+                let target = match s.kind {
+                    registry::TunnelKind::Direct => s.pattern.clone(),
+                    registry::TunnelKind::Remote => format!("{}@{}", s.host.as_deref().unwrap_or("?"), s.pattern),
+                };
+                println!("{:<20} {:<28} {:>7} {:>7} {:>8}",
+                    s.display_name(), target, s.local_port, s.remote_port, status);
+            }
+        }
+
+        Cmd::TunnelRm { key } => {
+            if registry::remove(&key)? {
+                println!("Removed '{}' from the persistent tunnel registry.", key);
+                println!("{}", gray("(run `awsx2 tunnel-stop` then `tunnel-up` to apply if the supervisor is running)"));
+            } else {
+                eprintln!("No registered tunnel matching '{}'.", key);
+                std::process::exit(1);
+            }
+        }
+
+        Cmd::TunnelInstall => {
+            launchd::install()?;
+            let path = launchd::plist_location()?;
+            println!("Installed LaunchAgent '{}'.", launchd::LABEL);
+            println!("  plist: {}", path.display());
+            println!("  logs:  ~/Library/Logs/awsx2-tunnels.{{out,err}}.log");
+            println!("Persistent tunnels will now start at login and be kept alive.");
+            println!("{}", gray("Note: after SSO expiry the supervisor retries; run `awsx2 login` to restore."));
+        }
+
+        Cmd::TunnelUninstall => {
+            launchd::uninstall()?;
+            println!("Removed LaunchAgent '{}'.", launchd::LABEL);
         }
 
         Cmd::EcrImages { repository, region, latest } => {

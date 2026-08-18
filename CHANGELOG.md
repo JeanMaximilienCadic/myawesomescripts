@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- awsx2 persistent, self-healing tunnels: `tunnel --keep-alive`, `tunnel-up`, `tunnel-list`, `tunnel-rm`, and `tunnel-install`/`tunnel-uninstall` (macOS LaunchAgent). A supervisor auto-reconnects dropped SSM tunnels; desired state persists in `~/.config/awsx2/tunnels.json`. `tunnel-stop` now also stops the supervisor (`aws/awsx2`)
 - Claude Code agents for automated commit, PR, changelog, readme, label, link-issue, taskfile, and Snyk PR management (`agents/commands/`)
 - `gitit` auto-commit script with LLM-powered commit message and PR draft generation (`development/gitit`)
 - S3 bucket mounting via rclone (`aws/s3/mount_s3`)
