@@ -34,6 +34,22 @@ fn gray(s: impl std::fmt::Display) -> String {
     format!("\x1b[90m{}\x1b[0m", s)
 }
 
+/// ANSI color code for an instance state, used for the status bullet.
+fn state_color(state: &str) -> &'static str {
+    match state {
+        "running"                   => "32", // green  — up
+        "stopped"                   => "33", // yellow — off but recoverable
+        "pending" | "stopping"      => "36", // cyan   — transitional
+        "terminated" | "shutting-down" => "31", // red — gone
+        _                           => "90", // gray   — unknown
+    }
+}
+
+/// A colored ● bullet for the given state (color code only wraps the glyph).
+fn state_bullet(state: &str) -> String {
+    format!("\x1b[{}m●\x1b[0m", state_color(state))
+}
+
 fn find_pid_on_port(port: u16) -> Option<u32> {
     // Try LISTEN state first (clean tunnel), then any TCP state (socat with active connections)
     for args in [
@@ -340,18 +356,62 @@ fn run_cli(cmd: Cmd) -> error::Result<()> {
     match cmd {
         Cmd::List => {
             let instances = aws::list_instances(None)?;
-            println!(
-                "{:<22} {:<30} {:<14} {:<12} {:<10} {:<18}",
-                "INSTANCE ID", "NAME", "TYPE", "STATE", "SSM", "PRIVATE IP"
-            );
-            println!("{}", "-".repeat(110));
-            for i in &instances {
-                println!(
-                    "{:<22} {:<30} {:<14} {:<12} {:<10} {:<18}",
-                    i.id, i.name, i.instance_type,
-                    i.state.as_str(), i.ssm_status.as_str(),
-                    i.private_ip.as_deref().unwrap_or("-"),
-                );
+
+            // Build each row as plain (uncolored) cell strings. The STATE cell
+            // carries a "● " bullet prefix so column widths account for it; the
+            // bullet is colorized only at print time so it never skews padding.
+            let headers = ["INSTANCE ID", "NAME", "TYPE", "STATE", "SSM", "PRIVATE IP"];
+            let rows: Vec<[String; 6]> = instances
+                .iter()
+                .map(|i| {
+                    [
+                        i.id.clone(),
+                        i.name.clone(),
+                        i.instance_type.clone(),
+                        format!("● {}", i.state.as_str()),
+                        i.ssm_status.as_str().to_string(),
+                        i.private_ip.as_deref().unwrap_or("-").to_string(),
+                    ]
+                })
+                .collect();
+
+            // Column width = widest of the header and every value in that column.
+            let mut widths: [usize; 6] = headers.map(|h| h.len());
+            for row in &rows {
+                for (w, cell) in widths.iter_mut().zip(row) {
+                    *w = (*w).max(cell.chars().count());
+                }
+            }
+
+            let gap = 2; // spaces between columns
+            let pad = |s: &str, w: usize| format!("{:<width$}", s, width = w);
+
+            // Header + separator sized to the actual table width.
+            let header_line = headers
+                .iter()
+                .enumerate()
+                .map(|(c, h)| pad(h, widths[c]))
+                .collect::<Vec<_>>()
+                .join(&" ".repeat(gap));
+            println!("{}", header_line);
+            let total: usize = widths.iter().sum::<usize>() + gap * (widths.len() - 1);
+            println!("{}", "-".repeat(total));
+
+            for (row, i) in rows.iter().zip(&instances) {
+                let cells: Vec<String> = row
+                    .iter()
+                    .enumerate()
+                    .map(|(c, cell)| {
+                        let padded = pad(cell, widths[c]);
+                        if c == 3 {
+                            // STATE: colorize just the bullet, keep padding intact.
+                            padded.replacen('●', &state_bullet(i.state.as_str()), 1)
+                        } else {
+                            padded
+                        }
+                    })
+                    .collect();
+                println!("{}", cells.join(&" ".repeat(gap)));
             }
         }
 
