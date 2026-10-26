@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `feature-from-zip` Claude Code skill: turns a feature delivered as a .zip into a GitHub issue, develops it in a temporary resource-capped LXD container on the LAN (`devbox.sh`), tunnels frontends for review, opens the PR after explicit approval, and babysits CI to green with auto-merge (`agents/skills/feature-from-zip/`)
 - awsx2 persistent, self-healing tunnels: `tunnel --keep-alive`, `tunnel-up`, `tunnel-list`, `tunnel-rm`, and `tunnel-install`/`tunnel-uninstall` (macOS LaunchAgent). A supervisor auto-reconnects dropped SSM tunnels; desired state persists in `~/.config/awsx2/tunnels.json`. `tunnel-stop` now also stops the supervisor (`aws/awsx2`)
 - `/review-pr-queue` Claude Code agent: works the cross-repo `review-requested:@me` backlog end to end — discovers PRs, labels and assigns them, reviews each diff with findings verified against the repository, and posts one review per PR (`agents/commands/review-pr-queue.md`)
 - Claude Code agents for automated commit, PR, changelog, readme, label, link-issue, taskfile, and Snyk PR management (`agents/commands/`)

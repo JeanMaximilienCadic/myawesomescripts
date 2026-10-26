@@ -31,7 +31,7 @@
 | **python/** | Python tooling &mdash; UV package manager wrapper |
 | **system/** | System administration &mdash; system info, cleanup, resource monitor |
 | **virtualization/** | VM and container provisioning &mdash; Lima config, LXD setup scripts |
-| **agents/** | Claude Code agent definitions for automated commits, PRs, changelogs, and more |
+| **agents/** | Claude Code agent definitions and skills for automated commits, PRs, changelogs, feature delivery, and more |
 
 # Code structure
 
@@ -84,7 +84,9 @@ myawesomescripts/
 │           ├── mc_alias               # MinIO client alias setup
 │           └── mount_s3fs             # S3FS bucket mounting
 ├── agents/
-│   └── commands/                      # Claude Code agent definitions
+│   ├── commands/                      # Claude Code agent definitions
+│   └── skills/
+│       └── feature-from-zip/          # Zip → issue → LXD dev box → PR → green CI skill
 ├── .gitignore
 └── README.md
 ```
