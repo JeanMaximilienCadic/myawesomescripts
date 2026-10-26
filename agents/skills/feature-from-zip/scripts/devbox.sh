@@ -2,7 +2,7 @@
 # devbox.sh — temporary, resource-capped LXD dev containers on the LAN for feature-from-zip.
 # macOS bash 3.2 compatible. State per box lives in ~/.cache/ffz/<name>.env
 #
-#   devbox.sh pick [mem_gib]                 first reachable LAN host with lxc + enough free RAM
+#   devbox.sh pick [mem_gib]                 first reachable host in $FFZ_HOSTS with lxc + enough free RAM
 #   devbox.sh up <name> [cpu] [mem] [disk]   launch + wait for cloud-init (defaults 4 / 8GiB / 40GiB)
 #   devbox.sh run <name> <cmd...>            run as foo in /home/foo/work/repo (bash -lc)
 #   devbox.sh root <name> <cmd...>           run as root
@@ -13,7 +13,8 @@
 set -euo pipefail
 
 STATE_DIR="${HOME}/.cache/ffz"
-HOSTS="${FFZ_HOSTS:-x399 i9 cloudcompute}"
+# Space-separated ssh aliases of LAN hosts running LXD, in order of preference.
+HOSTS="${FFZ_HOSTS:-}"
 IMAGE="${FFZ_IMAGE:-ubuntu:24.04}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Working copy inside the box, under /home/foo/work. FFZ_DIR=<name> keeps a
@@ -22,8 +23,9 @@ DIR="${FFZ_DIR:-repo}"
 mkdir -p "$STATE_DIR"
 
 die() { echo "devbox: $*" >&2; exit 1; }
+need_hosts() { [ -n "$HOSTS" ] || die "set FFZ_HOSTS to your LXD hosts' ssh aliases (e.g. FFZ_HOSTS=\"host1 host2\")"; }
 
-# Resolve lxc binary on a host (zk0node02/i9/cloudcompute only have the snap path).
+# Resolve lxc binary on a host (snap-only installs have just /snap/bin/lxc).
 lxc_bin() { ssh -o ConnectTimeout=6 "$1" 'command -v lxc || ls /snap/bin/lxc' 2>/dev/null | head -1; }
 
 load() {
@@ -44,6 +46,7 @@ as_foo() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   pick)
+    need_hosts
     need_kb=$(( ${1:-8} * 1024 * 1024 + 4 * 1024 * 1024 ))   # cap + 4GiB headroom
     for h in $HOSTS; do
       bin=$(lxc_bin "$h") || continue
@@ -119,6 +122,7 @@ STATE
   info) load "${1:?name}"; cat "$STATE_DIR/$1.env" ;;
 
   list)
+    need_hosts
     for h in $HOSTS; do
       bin=$(lxc_bin "$h") || continue; [ -n "$bin" ] || continue
       ssh -o ConnectTimeout=6 "$h" "$bin list user.ffz=1 -f csv -c ns" 2>/dev/null | sed "s/^/$h,/"

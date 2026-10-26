@@ -1,6 +1,6 @@
 ---
 name: feature-from-zip
-description: Implement a feature delivered as a .zip (task description + partial/full code). Files the GitHub issue, develops in a temporary resource-capped LXD container on the LAN (x399 preferred), tunnels frontends to the browser for review, opens the PR after approval, babysits CI to green and enables auto-merge. Use when the user says "feature from zip", "/feature-from-zip <path>", or hands over a zip containing a feature to build.
+description: Implement a feature delivered as a .zip (task description + partial/full code). Files the GitHub issue, develops in a temporary resource-capped LXD container on the LAN, tunnels frontends to the browser for review, opens the PR after approval, babysits CI to green and enables auto-merge. Use when the user says "feature from zip", "/feature-from-zip <path>", or hands over a zip containing a feature to build.
 argument-hint: <path/to/feature.zip> [owner/repo] [--cpu N --mem 8GiB --disk 40GiB]
 ---
 
@@ -48,14 +48,14 @@ Take the first one that works:
 1. An explicit `owner/repo` argument.
 2. A repo URL or name in the spec.
 3. A `.git`/remote inside the zip.
-4. Matching provided file paths against known repos: `~/code/*`, `gh repo list zakuro-ai`,
-   `gh repo list jlsi`, and the repo table in memory.
+4. Matching provided file paths against known repos: `~/code/*`, `gh repo list <org>` for
+   the orgs you work in, and the repo table in memory.
 
 If it is still ambiguous, AskUserQuestion with the top candidates. Also get the default branch:
 `gh repo view R --json defaultBranchRef,autoMergeAllowed,squashMergeAllowed,mergeCommitAllowed,rebaseMergeAllowed`.
 
 **Read the repo's CLAUDE.md / CONTRIBUTING / PR template** before writing anything. Repo rules override
-this skill (for example, jlsi/pegasus forbids `Co-Authored-By` trailers).
+this skill (for example, a repo that forbids `Co-Authored-By` trailers).
 
 ## 3. File the GitHub issue
 
@@ -80,7 +80,7 @@ BR=feat/$ISSUE-$SLUG
   || { gh repo clone R "$WORK/repo" && git -C "$WORK/repo" switch -c "$BR"; }
 
 D=~/.claude/skills/feature-from-zip/scripts/devbox.sh
-$D up "$BOX" 4 8GiB 40GiB        # picks x399 → i9 → cloudcompute by free RAM; FFZ_HOST=… to force one
+$D up "$BOX" 4 8GiB 40GiB        # picks the first host in $FFZ_HOSTS with enough free RAM; FFZ_HOST=… to force one
 $D sync "$BOX" "$WORK/repo"      # respects .gitignore, so no node_modules/target/.venv from the Mac
 ```
 - Two branches in one box (say a bugfix found along the way): `FFZ_DIR=<dir> $D sync/run …` keeps
@@ -90,7 +90,7 @@ $D sync "$BOX" "$WORK/repo"      # respects .gitignore, so no node_modules/targe
   you do step 5 planning. The box comes with user `foo` (sudo), docker (nesting enabled), git, gh,
   python3-pip and cargo. Install the toolchain the repo needs: node via `nvm`/`corepack`, `uv`,
   rustup, etc. Prefer the repo's own bootstrap (`Taskfile`, `Makefile`, `.tool-versions`, devcontainer).
-- Needs a GPU → `FFZ_HOST=x399` and, after `up`, `ssh x399 lxc profile add $BOX gpu-profile && ssh x399 lxc restart $BOX`.
+- Needs a GPU → `FFZ_HOST=<gpu-host>` and, after `up`, `ssh <gpu-host> lxc profile add $BOX gpu-profile && ssh <gpu-host> lxc restart $BOX`.
 - Runtime secrets (`.env`, API keys) → ask the user. Never copy them from other machines on your own.
 - Dev/test scaffolding you add (Dockerfile.dev, compose.dev.yml) stays local and is **never committed**.
 
@@ -118,7 +118,7 @@ $D sync "$BOX" "$WORK/repo"      # respects .gitignore, so no node_modules/targe
 - Verify with `curl -sI http://localhost:5173` before handing it over, and confirm it serves *your*
   branch (fetch one of your changed modules through the tunnel).
 - Prefer real data for review: if the repo can point the dev server's API proxy at staging
-  (zak-marketplace: `VITE_FORGE_API_URL=/api/forge npx vite --mode staging`), the user signs in with
+  (for a Vite app, an API base URL env var plus `npx vite --mode staging`), the user signs in with
   their own account in the browser and no credentials enter the box. Optionally open it with
   claude-in-chrome and screenshot the new screen for the summary.
 - After each code change, `$D sync`. HMR picks it up; check `/tmp/dev.log` for errors.
@@ -144,12 +144,12 @@ gh pr merge -R R <PR> --auto --squash      # or --merge/--rebase, whichever the 
 - If `autoMergeAllowed` is false, or the repo has no branch protection (in which case `--auto` errors
   or merges immediately), **do not merge yourself**. Just report "ready to merge" in step 9.
 - Check `.github/workflows/` for a repo-level `automerge` workflow before promising a manual merge.
-  zak-marketplace has one, and it merged the PR the moment checks went green.
+  Some repos have one, and it merges the PR the moment checks went green.
 - Check which CI **lane** a PR gets. Repos may run a "fast" suite on PRs and keep e2e/Playwright for
-  a label (zak-marketplace: `ci:full`). If the feature added e2e specs, add that label at creation
+  a label (e.g. `ci:full`). If the feature added e2e specs, add that label at creation
   (`--label ci:full`) so they run before the merge, not only in the box.
 
-- Repos that judge **every check run on the head SHA** (zak-marketplace's automerge does): a
+- Repos that judge **every check run on the head SHA** (some automerge workflows do): a
   cancelled run, or a lane change such as dropping `ci:full`, leaves stale failures on that SHA. A
   re-run replays the old event payload, labels included, and `unlabeled` may not trigger CI. Push an
   empty follow-up commit (`git commit --allow-empty`) to get a clean head.
@@ -161,9 +161,9 @@ gh pr merge -R R <PR> --auto --squash      # or --merge/--rebase, whichever the 
 - On failure: `gh run view <run> -R R --log-failed`. Reproduce it in the box (`$D run`), fix it on the
   Mac, commit (`fix(ci): …`), push, and watch again. Each fix is a normal follow-up push; never
   force-push over review history.
-- Known noise in zakuro-ai repos: the `runner / probe` job can be red during GitHub billing stops. That
-  is cosmetic and does not block merging. ARC self-hosted runners use `runs-on: cpu`. `pull_request`
-  runs report the merge-commit SHA, not the branch head.
+- Learn the repo's known CI noise (e.g. a runner probe job that goes red during GitHub billing stops
+  is cosmetic) and its runner labels for self-hosted runners. `pull_request` runs report the
+  merge-commit SHA, not the branch head.
 - Before calling a failure "pre-existing", prove it: run the same spec on an untouched `main`
   checkout in the box (`git archive origin/main`, using `FFZ_DIR=main`), and find the last full
   CI run that passed. Then file an issue with the evidence and ask the user. Never skip or
