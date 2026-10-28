@@ -1,5 +1,5 @@
 ---
-description: Fix a large batch of GitHub issues without exhausting the machine — group issues into few PRs, scan the LAN, run each group's builds/tests in a capped ephemeral LXC slot, one PR per group, merge on green
+description: Fix a large batch of GitHub issues without exhausting the machine — group issues into few PRs (reviving stale ones), inventory the LAN, print a wave-by-wave dispatch plan (issues, PR, host, ETA), run each group's builds/tests in a capped slot, one PR per group, merge on green
 argument-hint: "<owner/repo | project slice URL | issue URLs> [issue numbers] [--label L] [--milestone M] [--limit N] [--max-group 6] [--slot cpu:mem] [--docker] [--dry-run]"
 ---
 
@@ -7,7 +7,7 @@ argument-hint: "<owner/repo | project slice URL | issue URLs> [issue numbers] [-
 
 Two root causes made past sweeps exhaust the machine. First, every build and test ran on one host. Second, every issue got
 its own worktree, test runs and PR. This command fixes both: **few PRs (one per group)** and **builds/tests on capped LAN slots**.
-Load the `lan-dispatch` skill first; it documents `ldw` (the `LDW` path below).
+Load the `lan-dispatch` skill first if it's installed; it documents `ldw` (the `LDW` path below). Step 3 covers running without it.
 
 Decide by yourself and don't stop for confirmations. Only real blockers go back to the user:
 secrets, admin merges, sudo on a host.
@@ -43,11 +43,65 @@ the files and modules it touches: paths in the body, symbols grepped in the code
 Before dispatching, find the repo's **cross-checks**: tests that pin one side's files from the other side (citation/line-pin
 tests, OpenAPI contract snapshots, generated-type checks). Read the CI workflow for them, and put them in every brief.
 
-Write `groups.json`: `[{id, title, issues:[n...], files:[...], suite:"<full test command>", targeted:"<fast test cmd>", rationale}]`.
-Print a table: group, issues, files, suite. Report the reduction ("41 issues → 9 PRs, 9 full-suite runs instead of 41").
-`--dry-run` stops here after the Step 3 scan.
+Batch as many issues per PR as is logical, and take as many issues as can be done. Only leave out issues that can't be
+done: epics and trackers, open decisions and ADR proposals, issues blocked by an open upstream issue, and issues that
+need production access. Check each `blockedBy` link; a closed blocker means the issue can be taken.
 
-## Step 3 — Scan the LAN and reserve slots
+Look for work that already exists before planning new work:
+- **Your own stale PRs** (drafts, conflicting, or red, with no activity for days) that close candidate issues. Plan a
+  *revive* group for each: merge the default branch in, fix the checks, mark it ready. Count the issues it closes.
+- **Pushed branches with no PR** and **unpushed local worktree commits** for candidate issues. Resume from them.
+- **Epic branches** (`epic/*`) where sub-issues are being built. Plan groups that target that branch, not the default branch.
+
+Write `groups.json`: `[{id, title, issues:[n...], files:[...], suite:"<full test command>", targeted:"<fast test cmd>",
+kind:"api|web|docs", base:"<default or epic/*>", revive:<PR# or null>, wave:n, gate:"<what must merge first>", eta_h:n, rationale}]`.
+Print a table: group, issues, files, suite. Report the reduction ("41 issues → 9 PRs, 9 full-suite runs instead of 41").
+Also list the issues that were left out, each with its reason.
+
+## Step 3 — Dispatch plan (LAN inventory and waves)
+Run this before any slot is reserved. `--dry-run` stops after printing it.
+
+**Inventory.** Probe every host in `~/.ssh/config` (and the jump-host paths in CLAUDE.md), read-only, with
+`ssh -o BatchMode=yes -o ConnectTimeout=6`: cpu, load, available memory, free disk, docker / compose / lxc / node /
+python versions, npm and GitHub egress. If a host doesn't answer, check its config address and say why it failed
+(no route, no DNS, host key not verified). Never accept a host key yourself; ask the user to check it.
+Print a capacity table: host | cpu | load | mem avail | slots | note.
+- Never use hosts that run production or staging infrastructure (ArgoCD, edge proxies, CI runners, k3s) as slots.
+- A host without the runtime the suite needs, or below the required language version, gets no slot.
+- API slots need docker compose (DB fixtures). A host with only node gets web-only slots.
+- Slot sizes: API 3 cpu / 6 GB, web 2–3 cpu / 4–6 GB. Leave headroom: no new slot when load > 0.75 × cpu, or
+  available memory < 2 × slot memory.
+
+**Leaked slots.** List `ldw-*` instances on every host (`lxc list --all-projects`, `docker ps -a --filter label=ldw.run`),
+with `user.ldw.run`, `user.ldw.expires` and the `/work/*` directory inside each. For an expired slot, check whether its
+work is on a branch or a merged PR. Work that exists only in the slot is a **salvage** step, done before anything else:
+copy it to a local worktree and push it as a WIP commit. Deleting a slot needs the user's OK. Leave slots from other runs
+or repos alone.
+
+**Without `ldw`.** If `ldw` isn't installed on any reachable host, start slots by hand in the same shape:
+an LXC slot from the `ldw-cache` image (`limits.cpu`, `limits.memory`, `security.nesting=true` for API), a capped
+`docker run --cpus --memory` container, or a `nice -n 19` directory with `--maxWorkers=2` on a host with only node.
+Label every slot with `ldw.run=<repo>-<MMDD>`, owner and an expiry 24h out. Sync with tar over ssh. Git, gh and edits
+stay on the controller.
+
+**Waves.** Assign each group a slot that fits its `kind`. Wave 1 is everything without a gate. A gate is a merge the
+group needs (a dependency, the open PR that touches the same files, a revived PR). Groups that only share a contract
+can run in the same wave if the contract is in both briefs. Two revive groups on the same files run one after the other
+on the same slot.
+
+Print one table per wave, with the ETAs counted from **T0** (the start of wave 1) and including ~30 min of PR CI:
+
+| Batched issues | PR | Host / slot | ETA (done) |
+|---|---|---|---|
+| #515, #545 | new: <title> | x399 API-1 | ~T0+1.5h |
+| #631, #632, … | revive **#649** | msi API-5 | ~T0+1.5h |
+
+Then print: peak workers per host, total (issues → PRs, of which revived), the overall ETA, the least certain rows, and
+**Needs your OK**: the slots to start, salvage steps, drafts to mark ready, and slots to delete. Save the plan to the
+scratchpad as `dispatch-plan.md`. Wait for the user's OK on that list before Step 4; nothing else needs one.
+
+## Step 4 — Reserve slots
+With `ldw` (otherwise start the Step 3 slots by hand, in the same shape):
 ```
 $LDW scan --cpu C --mem M          # read the "free" column; hosts that are unreachable or under pressure show 0
 $LDW up --run <repo>-<MMDD> --count <min(len(groups), total_free)> --cpu C --mem M [--docker]
@@ -55,12 +109,12 @@ $LDW up --run <repo>-<MMDD> --count <min(len(groups), total_free)> --cpu C --mem
 If 0 slots are free anywhere, do **not** fall back to local builds. Wait 10 min (Monitor until-loop on `ldw scan --json`),
 or run with at most 1 local worker using `nice -n 19` and `-n 2` test parallelism. Say which in the report.
 
-## Step 4 — Worktrees (local, light)
+## Step 5 — Worktrees (local, light)
 One worktree per **group**:
 `git worktree add ~/<repo>-worktrees/<group-id> -b fix/<group-id> origin/<default>`.
-No dependency install on the Mac: `node_modules`, `.venv` and `target` live only in the slots.
+No dependency install on the controller: `node_modules`, `.venv` and `target` live only in the slots.
 
-## Step 5 — Dispatch workers (one per slot; queue the rest)
+## Step 6 — Dispatch workers (one per slot; queue the rest)
 Start one background Agent per reserved slot, each with one group. When an agent finishes, `$LDW reset <slot>` and start
 the next queued group on that slot. Concurrency = number of slots, never more.
 
@@ -88,13 +142,16 @@ RULES
 - Report: STATUS green|red|partial, PR number, issues closed / dropped (with reason), slot time used.
 ```
 
-## Step 6 — Merge and close out
+## Step 7 — Merge and close out
 - Merge each green PR right away after a `git merge-tree --write-tree origin/<default> origin/fix/<group-id>`
   conflict check. On a conflict, the worker of the second PR merges the default branch
   into its branch and reruns the suite in its slot. Review the diff in depth only for P0, security or money-moving changes.
-- Repos with their own rules win (e.g. some repos get a PR only, no merge).
+- Repos with their own rules win (e.g. some repos get a PR only, no merge, or an automerge workflow that merges green PRs).
+- PRs into `epic/*` branches are not covered by automerge: merge them after the same conflict check.
+- Security and money-moving PRs get the `do-not-merge` label until you've reviewed them in depth.
 - When every group is done: `$LDW down --run <id>`, then `$LDW list` must show nothing for the run. Remove the merged worktrees.
 
 ## Report
-Print a table: group → issues → PR → status → slot@host → full-suite time. List the issues that were dropped or blocked, with reasons.
+Print the Step 3 wave tables again, with the PR numbers filled in and a status column: green | red | partial | queued,
+plus the full-suite time. List the issues that were dropped or blocked, with reasons.
 Include the reduction line (issues → PRs, suite runs saved) and the peak slots per host.
