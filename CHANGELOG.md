@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Added
+- `/batch-fix` Claude Code command: groups a large batch of GitHub issues into a few PRs and runs each group's builds/tests in capped LAN LXC slots via the `lan-dispatch` skill's `ldw` (`agents/commands/batch-fix.md`)
 - `feature-from-zip` Claude Code skill: turns a feature delivered as a .zip into a GitHub issue, develops it in a temporary resource-capped LXD container on the LAN (`devbox.sh`), tunnels frontends for review, opens the PR after explicit approval, and babysits CI to green with auto-merge (`agents/skills/feature-from-zip/`)
 - awsx2 persistent, self-healing tunnels: `tunnel --keep-alive`, `tunnel-up`, `tunnel-list`, `tunnel-rm`, and `tunnel-install`/`tunnel-uninstall` (macOS LaunchAgent). A supervisor auto-reconnects dropped SSM tunnels; desired state persists in `~/.config/awsx2/tunnels.json`. `tunnel-stop` now also stops the supervisor (`aws/awsx2`)
 - `/review-pr-queue` Claude Code agent: works the cross-repo `review-requested:@me` backlog end to end — discovers PRs, labels and assigns them, reviews each diff with findings verified against the repository, and posts one review per PR (`agents/commands/review-pr-queue.md`)
